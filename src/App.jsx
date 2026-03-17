@@ -1,20 +1,10 @@
-import { useState } from 'react'
-import SmartLogisApp from './SmartLogis_v5'
-import LandingPage from './LandingPage'
+import React from 'react';
+import SmartLogisApp from './SmartLogis_v5'; // This imports your big file
 
-export default function App() {
-  const [screen, setScreen] = useState('landing') // 'landing' | 'app'
-  const [user, setUser] = useState(null)
-
-  if (screen === 'landing') {
-    return <LandingPage onEnter={() => setScreen('app')} />
-  }
-
+function App() {
   return (
-    <SmartLogisApp
-      initialUser={user}
-      onUserChange={setUser}
-      onGoLanding={() => setScreen('landing')}
-    />
-  )
+    <SmartLogisApp />
+  );
 }
+
+export default App;
