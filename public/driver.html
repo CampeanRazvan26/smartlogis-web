@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>SmartLogis — GPS Șofer</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+    background:#060810;color:#f9fafb;min-height:100vh;
+    display:flex;align-items:center;justify-content:center;}
+  .card{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);
+    border-radius:20px;padding:32px 28px;max-width:380px;width:100%;margin:20px;}
+  .logo{display:flex;align-items:center;gap:10px;margin-bottom:28px;}
+  .logo-icon{width:40px;height:40px;background:#f9fafb;border-radius:10px;
+    display:flex;align-items:center;justify-content:center;font-size:18px;}
+  .logo-title{font-size:16px;font-weight:800;color:#f9fafb;}
+  .logo-sub{font-size:10px;color:#6b7280;margin-top:2px;}
+  .status{padding:14px 16px;border-radius:12px;margin:16px 0;font-size:13px;line-height:1.6;}
+  .status.inactive{background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.07);color:#6b7280;}
+  .status.active{background:rgba(16,185,129,.08);border:1px solid rgba(16,185,129,.25);color:#86efac;}
+  .status.error{background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.25);color:#fca5a5;}
+  .btn{width:100%;padding:14px;border:none;border-radius:12px;font-size:15px;
+    font-weight:700;cursor:pointer;transition:all .2s;margin-top:8px;}
+  .btn-start{background:linear-gradient(135deg,#34d399,#10b981);color:#022c22;}
+  .btn-start:hover{transform:translateY(-2px);box-shadow:0 8px 24px rgba(16,185,129,.4);}
+  .btn-stop{background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.25);color:#f87171;}
+  .btn:disabled{opacity:.5;cursor:not-allowed;transform:none;}
+  .info-row{display:flex;justify-content:space-between;padding:8px 0;
+    border-bottom:1px solid rgba(255,255,255,.04);font-size:12px;}
+  .info-key{color:#6b7280;}
+  .info-val{color:#e5e7eb;font-family:monospace;font-weight:600;}
+  .dot{width:8px;height:8px;border-radius:50%;background:#34d399;display:inline-block;
+    margin-right:6px;animation:pulse 1.5s ease-in-out infinite;}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">
+    <div class="logo-icon">🚛</div>
+    <div>
+      <div class="logo-title">SmartLogis</div>
+      <div class="logo-sub">TRACKER GPS ȘOFER</div>
+    </div>
+  </div>
+
+  <div id="status" class="status inactive">
+    Apasă butonul pentru a porni transmisia GPS.
+    Asigură-te că ești pe traseul corect.
+  </div>
+
+  <div id="info" style="display:none;margin-bottom:8px;">
+    <div class="info-row"><span class="info-key">Latitudine</span><span class="info-val" id="lat">—</span></div>
+    <div class="info-row"><span class="info-key">Longitudine</span><span class="info-val" id="lng">—</span></div>
+    <div class="info-row"><span class="info-key">Acuratețe</span><span class="info-val" id="acc">—</span></div>
+    <div class="info-row"><span class="info-key">Ultimul update</span><span class="info-val" id="ts">—</span></div>
+    <div class="info-row"><span class="info-key">Updates trimise</span><span class="info-val" id="count">0</span></div>
+  </div>
+
+  <button class="btn btn-start" id="startBtn" onclick="startTracking()">▶ Pornește GPS</button>
+  <button class="btn btn-stop" id="stopBtn" onclick="stopTracking()" style="display:none">⏹ Oprește GPS</button>
+</div>
+
+<script>
+  // ── Config ── (se poate injecta dinamic la generarea link-ului)
+  const SUPABASE_URL = 'https://ngteafqurfyryeinnsic.supabase.co'
+  const SUPABASE_ANON_KEY = 'sb_publishable_c5uUctTfPMhdrgE2vcMvCg_3zOgC3KV'
+  const TOKEN = new URLSearchParams(window.location.search).get('token') || ''
+
+  let watchId = null
+  let sendCount = 0
+  let intervalId = null
+
+  async function sendLocation(lat, lng, accuracy) {
+    if (!TOKEN || TOKEN === '') return
+    try {
+      const res = await fetch(`${SUPABASE_URL}/rest/v1/dispatch_tokens?token=eq.${TOKEN}`, {
+        method: 'PATCH',
+        headers: {
+          'apikey': SUPABASE_ANON_KEY,
+          'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+          'Content-Type': 'application/json',
+          'Prefer': 'return=minimal'
+        },
+        body: JSON.stringify({ last_lat: lat, last_lng: lng })
+      })
+
+      // Also update the vehicle directly (via a Supabase Function or direct update)
+      // We need the vehicle_id from the token — fetch it first
+      if (sendCount === 0) {
+        const tokenRes = await fetch(
+          `${SUPABASE_URL}/rest/v1/dispatch_tokens?token=eq.${TOKEN}&select=vehicle_id`,
+          { headers: { 'apikey': SUPABASE_ANON_KEY, 'Authorization': `Bearer ${SUPABASE_ANON_KEY}` } }
+        )
+        const data = await tokenRes.json()
+        if (data && data[0]?.vehicle_id) {
+          window._vehicleId = data[0].vehicle_id
+        }
+      }
+
+      if (window._vehicleId) {
+        await fetch(`${SUPABASE_URL}/rest/v1/vehicles?id=eq.${window._vehicleId}`, {
+          method: 'PATCH',
+          headers: {
+            'apikey': SUPABASE_ANON_KEY,
+            'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+            'Content-Type': 'application/json',
+            'Prefer': 'return=minimal'
+          },
+          body: JSON.stringify({ last_lat: lat, last_lng: lng, last_seen_at: new Date().toISOString() })
+        })
+      }
+
+      sendCount++
+      document.getElementById('count').textContent = sendCount
+    } catch (e) {
+      console.error('GPS send error:', e)
+    }
+  }
+
+  function onPosition(pos) {
+    const { latitude, longitude, accuracy } = pos.coords
+    document.getElementById('lat').textContent = latitude.toFixed(6)
+    document.getElementById('lng').textContent = longitude.toFixed(6)
+    document.getElementById('acc').textContent = Math.round(accuracy) + 'm'
+    document.getElementById('ts').textContent = new Date().toLocaleTimeString('ro-RO')
+    sendLocation(latitude, longitude, accuracy)
+  }
+
+  function onError(err) {
+    const s = document.getElementById('status')
+    s.className = 'status error'
+    s.innerHTML = '❌ Eroare GPS: ' + (
+      err.code === 1 ? 'Permisiunea GPS refuzată. Activează localizarea din setările browserului.' :
+      err.code === 2 ? 'Semnal GPS indisponibil.' :
+      'Timeout GPS. Încearcă din nou.'
+    )
+  }
+
+  function startTracking() {
+    if (!TOKEN) {
+      document.getElementById('status').className = 'status error'
+      document.getElementById('status').textContent = '❌ Token invalid. Solicită un nou link de la dispecer.'
+      return
+    }
+
+    if (!navigator.geolocation) {
+      document.getElementById('status').className = 'status error'
+      document.getElementById('status').textContent = '❌ Browserul tău nu suportă GPS.'
+      return
+    }
+
+    navigator.geolocation.getCurrentPosition(pos => {
+      onPosition(pos)
+      document.getElementById('status').className = 'status active'
+      document.getElementById('status').innerHTML = '<span class="dot"></span>GPS activ — trimiți locația la fiecare 30 secunde.'
+      document.getElementById('info').style.display = 'block'
+      document.getElementById('startBtn').style.display = 'none'
+      document.getElementById('stopBtn').style.display = 'block'
+
+      // Re-send every 30 seconds
+      intervalId = setInterval(() => {
+        navigator.geolocation.getCurrentPosition(onPosition, onError, {
+          enableHighAccuracy: true, timeout: 10000, maximumAge: 0
+        })
+      }, 30000)
+
+      // Watchposition for continuous tracking
+      watchId = navigator.geolocation.watchPosition(onPosition, onError, {
+        enableHighAccuracy: true, timeout: 15000, maximumAge: 5000
+      })
+
+    }, onError, { enableHighAccuracy: true, timeout: 15000 })
+
+    document.getElementById('startBtn').disabled = true
+    document.getElementById('status').textContent = '⌛ Se caută semnalul GPS…'
+  }
+
+  function stopTracking() {
+    if (watchId !== null) navigator.geolocation.clearWatch(watchId)
+    if (intervalId !== null) clearInterval(intervalId)
+    watchId = null; intervalId = null
+    document.getElementById('status').className = 'status inactive'
+    document.getElementById('status').textContent = 'GPS oprit. Apasă Start pentru a relua.'
+    document.getElementById('startBtn').style.display = 'block'
+    document.getElementById('startBtn').disabled = false
+    document.getElementById('stopBtn').style.display = 'none'
+    document.getElementById('info').style.display = 'none'
+    sendCount = 0
+  }
+
+  // Auto-start if token is present and page is opened intentionally
+  if (TOKEN) {
+    document.querySelector('.card').insertAdjacentHTML('afterbegin',
+      `<div style="background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.2);border-radius:10px;padding:10px 14px;margin-bottom:16px;font-size:12px;color:#93c5fd;">
+        Token detectat. Apasă Start GPS pentru a începe transmisia.
+      </div>`)
+  }
+</script>
+</body>
+</html>

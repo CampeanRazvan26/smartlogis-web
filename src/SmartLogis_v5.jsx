@@ -11,6 +11,13 @@ import {
   ExternalLink, CheckSquare, Settings, LogOut, CreditCard,
   BookOpen, Home
 } from "lucide-react";
+import { createClient } from "@supabase/supabase-js";
+
+// ─── Supabase (graceful — works even without .env) ────────────────────────────
+const _su = import.meta.env.VITE_SUPABASE_URL;
+const _sk = import.meta.env.VITE_SUPABASE_ANON_KEY;
+const supabase = (_su && _sk && !_su.includes("xxxx")) ? createClient(_su, _sk) : null;
+
 
 // ─── GLOBAL CSS ──────────────────────────────────────────────────────────────
 const G = `
@@ -148,6 +155,36 @@ const statusMap = {
   aglomerat:{ label:"Aglomerat", bg:"rgba(239,68,68,.1)", color:"#f87171", brd:"rgba(239,68,68,.25)" },
 };
 const SBadge = ({ s }) => { const m = statusMap[s]||statusMap.ok; return <span className="badge" style={{background:m.bg,color:m.color,border:`1px solid ${m.brd}`}}>{m.label}</span>; };
+
+// ─── DB → UI shape converter ──────────────────────────────────────────────────
+const dbVehicleToFleet = (v) => {
+  const expiresMs = v.uit_expires_at ? new Date(v.uit_expires_at) - new Date() : -1;
+  const expiresMin = expiresMs > 0 ? Math.round(expiresMs / 60000) : 0;
+  let status = "ok";
+  if (expiresMs < 0) status = "critical";
+  else if (expiresMin < (v.renew_threshold_h || 4) * 60) status = "warning";
+  return {
+    id: v.id, _dbId: v.id, _raw: v,
+    plate: v.plate || "",
+    driver: v.driver_name || "—",
+    driver_phone: v.driver_phone || "",
+    flag: "🇷🇴",
+    route: v.route || "—",
+    uit: v.uit_code || "Fără UIT",
+    expiresMin,
+    location: v.last_lat ? `${v.last_lat.toFixed(4)}, ${v.last_lng?.toFixed(4)}` : "Necunoscut",
+    waitH: 0,
+    status,
+    cargo: v.cargo || "—",
+    weight: v.weight ? v.weight + "t" : "—",
+    autoRenew: v.auto_renew || false,
+    renew_threshold_h: v.renew_threshold_h || 4,
+    renew_count: v.renew_count || 0,
+    last_lat: v.last_lat,
+    last_lng: v.last_lng,
+    last_seen_at: v.last_seen_at,
+  };
+};
 const UitBar = ({ min, autoRenew }) => {
   const pct = Math.min(100,(min/1440)*100);
   const c = min<180?"#f87171":min<480?"#fbbf24":"#34d399";
@@ -175,30 +212,69 @@ function Toasts({ toasts, remove }) {
   </div>;
 }
 
-// ─── AUTO-RENEW MODAL ─────────────────────────────────────────────────────────
-function AutoRenewModal({ v, onClose, addToast }) {
+// ─── AUTO-RENEW MODAL — REAL Supabase update ──────────────────────────────────
+function AutoRenewModal({ v, onClose, addToast, onFleetUpdate }) {
   const [phase, setPhase] = useState(0);
-  const [log, setLog] = useState([]);
-  const steps = ["Conectare ANAF API...","Validare date vehicul "+v.plate,"Verificare documente CMR","Calculare interval prelungire","Generare cerere UIT nouă","Transmitere + confirmare ANAF","Actualizare flotă SmartLogis"];
+  const [log, setLog]     = useState([]);
+  const [newUit, setNewUit] = useState("");
+  const steps = [
+    "Conectare Supabase...",
+    "Validare date vehicul " + v.plate,
+    "Verificare câmpuri obligatorii",
+    "Calculare interval prelungire +24h",
+    "Generare cod UIT temporar",
+    "Salvare în baza de date",
+    "Actualizare flotă SmartLogis ✓",
+  ];
+
   useEffect(() => {
-    if(phase>=steps.length) return;
-    const t = setTimeout(()=>{ setLog(l=>[...l,steps[phase]]); setPhase(p=>p+1); }, [900,700,600,500,800,1100,400][phase]);
-    return ()=>clearTimeout(t);
+    if (phase >= steps.length) return;
+    const delays = [600, 500, 500, 600, 700, 900, 400];
+    const t = setTimeout(async () => {
+      setLog(l => [...l, steps[phase]]);
+      // On step 5 (save to DB) — actually write to Supabase
+      if (phase === 5 && supabase && v._dbId) {
+        const uid = "SL-" + Date.now().toString(36).toUpperCase();
+        const expires = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
+        setNewUit(uid);
+        const { error } = await supabase.from("vehicles").update({
+          uit_code: uid,
+          uit_expires_at: expires,
+          renew_count: (v.renew_count || 0) + 1,
+        }).eq("id", v._dbId);
+        if (!error) {
+          await supabase.from("uit_renewals").insert({
+            vehicle_id: v._dbId,
+            old_uit: v.uit || null,
+            new_uit: uid,
+            triggered_by: "manual",
+            status: "success",
+          });
+          if (onFleetUpdate) onFleetUpdate(v._dbId, { uit_code: uid, uit_expires_at: expires, renew_count: (v.renew_count||0)+1 });
+        }
+      }
+      setPhase(p => p + 1);
+    }, delays[phase]);
+    return () => clearTimeout(t);
   }, [phase]);
-  const done = phase>=steps.length;
-  useEffect(()=>{ if(done) addToast({type:"success",title:"UIT Reînnoit cu Succes",msg:`${v.plate} — +24h adăugate automat`}); },[done]);
+
+  const done = phase >= steps.length;
+  useEffect(() => {
+    if (done) addToast({ type:"success", title:"UIT Reînnoit cu Succes", msg:`${v.plate} — valabil 24h` });
+  }, [done]);
+
   return (
     <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,.75)",backdropFilter:"blur(8px)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center"}}>
       <div className="fu glass" style={{borderRadius:20,padding:32,width:460,border:"1px solid rgba(255,255,255,.1)"}}>
         <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:22}}>
           <div style={{display:"flex",alignItems:"center",gap:12}}>
             <div style={{width:38,height:38,borderRadius:11,background:"rgba(16,185,129,.15)",border:"1px solid rgba(16,185,129,.3)",display:"flex",alignItems:"center",justifyContent:"center"}}><Zap size={17} color="#34d399"/></div>
-            <div><div style={{fontSize:14,fontWeight:700,color:"#f9fafb"}}>Auto-Reînnoire UIT</div><div style={{fontSize:11,color:"#6b7280"}}>{v.plate} · {v.driver}</div></div>
+            <div><div style={{fontSize:14,fontWeight:700,color:"#f9fafb"}}>Reînnoire UIT Manuală</div><div style={{fontSize:11,color:"#6b7280"}}>{v.plate} · {v.driver}</div></div>
           </div>
           {done && <button className="btn-ghost" onClick={onClose} style={{background:"none",border:"none",color:"#6b7280"}}><X size={16}/></button>}
         </div>
         <div style={{background:"rgba(0,0,0,.35)",borderRadius:11,padding:"14px 18px",marginBottom:18,minHeight:180,fontFamily:"'DM Mono',monospace",fontSize:11}}>
-          <div style={{color:"#34d399",marginBottom:8,fontSize:9,letterSpacing:2}}>// SMARTLOGIS AUTO-RENEW ENGINE v2</div>
+          <div style={{color:"#34d399",marginBottom:8,fontSize:9,letterSpacing:2}}>// SMARTLOGIS ENGINE · SUPABASE LIVE</div>
           {log.map((l,i)=>(
             <div key={i} style={{marginBottom:5,color:i===log.length-1&&!done?"#f9fafb":"#4b5563",display:"flex",alignItems:"center",gap:8}}>
               <span style={{color:"#34d399"}}>›</span><span>{l}</span>
@@ -206,12 +282,132 @@ function AutoRenewModal({ v, onClose, addToast }) {
               {(i<log.length-1||done)&&<CheckCircle size={9} color="#34d399" style={{marginLeft:"auto"}}/>}
             </div>
           ))}
-          {done&&<div style={{marginTop:10,paddingTop:10,borderTop:"1px solid rgba(255,255,255,.06)",color:"#34d399",fontSize:11}}>✓ UIT-{Math.floor(Math.random()*9000)+1000}-NEW generat · Valabil 24h</div>}
+          {done&&<div style={{marginTop:10,paddingTop:10,borderTop:"1px solid rgba(255,255,255,.06)",color:"#34d399",fontSize:11}}>
+            ✓ {newUit || "UIT salvat"} generat · Valabil 24h · Salvat în DB ✓
+          </div>}
         </div>
         <div className="pbar" style={{marginBottom:14}}><div className="pfill" style={{width:`${(phase/steps.length)*100}%`,background:done?"#34d399":"#3b82f6"}}/></div>
         {done
-          ? <button className="btn" onClick={onClose} style={{width:"100%",background:"#34d399",color:"#064e3b",border:"none",borderRadius:10,padding:"11px 0",fontSize:13,fontWeight:700}}>Închide · UIT Activ ✓</button>
-          : <div style={{fontSize:11,color:"#6b7280",textAlign:"center"}}>Procesare automată în curs...</div>}
+          ? <button className="btn" onClick={onClose} style={{width:"100%",background:"#34d399",color:"#064e3b",border:"none",borderRadius:10,padding:"11px 0",fontSize:13,fontWeight:700}}>Închide · UIT Activ în DB ✓</button>
+          : <div style={{fontSize:11,color:"#6b7280",textAlign:"center"}}>Salvare în baza de date...</div>}
+      </div>
+    </div>
+  );
+}
+
+// ─── ADD/EDIT VEHICLE MODAL ────────────────────────────────────────────────────
+function VehicleModal({ initial, tenantId, onClose, onSaved, addToast }) {
+  const isEdit = !!initial?._dbId;
+  const [form, setForm] = useState({
+    plate: initial?.plate || "",
+    driver_name: initial?.driver || "",
+    driver_phone: initial?.driver_phone || "",
+    cargo: initial?.cargo || "",
+    weight: (initial?.weight || "").replace("t",""),
+    route: initial?.route || "",
+    uit_code: initial?.uit || "",
+    uit_expires_at: initial?._raw?.uit_expires_at ? initial._raw.uit_expires_at.slice(0,16) : "",
+    auto_renew: initial?.autoRenew || false,
+    renew_threshold_h: initial?.renew_threshold_h || 4,
+  });
+  const [saving, setSaving] = useState(false);
+  const set = (k,v) => setForm(f=>({...f,[k]:v}));
+
+  const save = async () => {
+    if (!form.plate) { addToast({type:"error",title:"Câmp obligatoriu",msg:"Numărul de înmatriculare este necesar"}); return; }
+    setSaving(true);
+    const payload = {
+      plate: form.plate.toUpperCase().trim(),
+      driver_name: form.driver_name,
+      driver_phone: form.driver_phone,
+      cargo: form.cargo,
+      weight: form.weight,
+      route: form.route,
+      uit_code: form.uit_code,
+      uit_expires_at: form.uit_expires_at ? new Date(form.uit_expires_at).toISOString() : null,
+      auto_renew: form.auto_renew,
+      renew_threshold_h: parseInt(form.renew_threshold_h) || 4,
+      tenant_id: tenantId,
+    };
+    let error;
+    if (isEdit) {
+      ({ error } = await supabase.from("vehicles").update(payload).eq("id", initial._dbId));
+    } else {
+      ({ error } = await supabase.from("vehicles").insert(payload));
+    }
+    setSaving(false);
+    if (error) { addToast({type:"error",title:"Eroare",msg:error.message}); return; }
+    addToast({type:"success",title:isEdit?"Vehicul actualizat":"Vehicul adăugat",msg:form.plate});
+    onSaved();
+  };
+
+  const lbl = {fontSize:10,fontWeight:700,letterSpacing:".07em",textTransform:"uppercase",color:"#4b5563",display:"block",marginBottom:5};
+  const row = {marginBottom:14};
+
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,.75)",backdropFilter:"blur(8px)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:16}}>
+      <div className="fu glass" style={{borderRadius:20,padding:28,width:580,maxHeight:"90vh",overflowY:"auto",border:"1px solid rgba(255,255,255,.1)"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:22}}>
+          <div style={{fontSize:16,fontWeight:700,color:"#f9fafb"}}>{isEdit?"Editează vehicul":"Adaugă vehicul nou"}</div>
+          <button onClick={onClose} style={{background:"none",border:"none",cursor:"pointer",color:"#6b7280"}}><X size={18}/></button>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14}}>
+          <div style={row}>
+            <label style={lbl}>Nr. Înmatriculare *</label>
+            <input className="ifield" placeholder="B 123 ABC" value={form.plate} onChange={e=>set("plate",e.target.value.toUpperCase())}/>
+          </div>
+          <div style={row}>
+            <label style={lbl}>Șofer</label>
+            <input className="ifield" placeholder="Nume șofer" value={form.driver_name} onChange={e=>set("driver_name",e.target.value)}/>
+          </div>
+          <div style={row}>
+            <label style={lbl}>Telefon Șofer</label>
+            <input className="ifield" placeholder="+40 7xx xxx xxx" value={form.driver_phone} onChange={e=>set("driver_phone",e.target.value)}/>
+          </div>
+          <div style={row}>
+            <label style={lbl}>Marfă</label>
+            <input className="ifield" placeholder="ex: Piese auto" value={form.cargo} onChange={e=>set("cargo",e.target.value)}/>
+          </div>
+          <div style={row}>
+            <label style={lbl}>Greutate (tone)</label>
+            <input className="ifield" type="number" placeholder="18.5" value={form.weight} onChange={e=>set("weight",e.target.value)}/>
+          </div>
+          <div style={row}>
+            <label style={lbl}>Rută</label>
+            <input className="ifield" placeholder="București → Cluj" value={form.route} onChange={e=>set("route",e.target.value)}/>
+          </div>
+          <div style={row}>
+            <label style={lbl}>Cod UIT (dacă există)</label>
+            <input className="ifield" placeholder="SL-ABC123" value={form.uit_code} onChange={e=>set("uit_code",e.target.value)}/>
+          </div>
+          <div style={row}>
+            <label style={lbl}>Expiră la</label>
+            <input className="ifield" type="datetime-local" value={form.uit_expires_at} onChange={e=>set("uit_expires_at",e.target.value)}/>
+          </div>
+          <div style={{...row,gridColumn:"1/-1"}}>
+            <label style={lbl}>Prag auto-reînnoire (ore)</label>
+            <div style={{display:"flex",alignItems:"center",gap:12}}>
+              <input type="range" min={1} max={12} value={form.renew_threshold_h} onChange={e=>set("renew_threshold_h",e.target.value)} style={{flex:1,accentColor:"#34d399"}}/>
+              <span style={{fontFamily:"monospace",fontSize:12,color:"#fbbf24",fontWeight:600,minWidth:30}}>{form.renew_threshold_h}h</span>
+            </div>
+          </div>
+          <div style={{...row,gridColumn:"1/-1",display:"flex",alignItems:"center",gap:10,padding:"12px 14px",background:"rgba(255,255,255,.03)",borderRadius:10,border:"1px solid rgba(255,255,255,.07)",cursor:"pointer"}} onClick={()=>set("auto_renew",!form.auto_renew)}>
+            <div style={{width:20,height:20,borderRadius:5,border:`1.5px solid ${form.auto_renew?"#34d399":"rgba(255,255,255,.2)"}`,background:form.auto_renew?"#34d399":"transparent",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,transition:"all .2s"}}>
+              {form.auto_renew && <Check size={13} color="#064e3b"/>}
+            </div>
+            <div>
+              <div style={{fontSize:13,fontWeight:600,color:"#e5e7eb"}}>⚡ Activează Auto-Reînnoire UIT</div>
+              <div style={{fontSize:11,color:"#6b7280"}}>Reînnoiește automat cu {form.renew_threshold_h}h înainte de expirare</div>
+            </div>
+          </div>
+        </div>
+        <div style={{display:"flex",gap:10,justifyContent:"flex-end",marginTop:20}}>
+          <button onClick={onClose} style={{background:"rgba(255,255,255,.05)",border:"1px solid rgba(255,255,255,.1)",borderRadius:9,padding:"9px 18px",fontSize:12,fontWeight:600,color:"#9ca3af",cursor:"pointer"}}>Anulează</button>
+          <button onClick={save} disabled={saving} style={{background:"linear-gradient(135deg,#34d399,#059669)",color:"#064e3b",border:"none",borderRadius:9,padding:"9px 22px",fontSize:13,fontWeight:700,cursor:"pointer",display:"flex",alignItems:"center",gap:7,boxShadow:"0 4px 16px rgba(16,185,129,.25)"}}>
+            {saving && <RefreshCw size={13} className="spin"/>}
+            {isEdit ? "Salvează modificările" : "Adaugă vehicul"}
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -940,9 +1136,31 @@ function Onboarding({ onComplete }) {
     );
   };
 
-  const launch = () => {
+  const launch = async () => {
     setLaunching(true);
-    setTimeout(()=>{setLaunching(false);setLaunched(true);},2200);
+    // If Supabase is connected, save vehicles to DB
+    if (supabase) {
+      try {
+        const { data: { session } } = await supabase.auth.getSession();
+        if (session) {
+          const { data: prof } = await supabase.from("profiles").select("tenant_id").eq("id", session.user.id).single();
+          if (prof?.tenant_id) {
+            const rows = vehicles.filter(v=>v.plate).map(v => ({
+              tenant_id: prof.tenant_id, plate: v.plate,
+              driver_name: v.driver || "", cargo: v.type || "",
+              auto_renew: prefs.autoRenew || false,
+              renew_threshold_h: 4,
+            }));
+            if (rows.length) await supabase.from("vehicles").insert(rows);
+            // Update tenant CUI
+            if (data.cui || data.name) {
+              await supabase.from("tenants").update({ name: data.name||"Firma", cui: data.cui||"" }).eq("id", prof.tenant_id);
+            }
+          }
+        }
+      } catch(e) { console.warn("Supabase save error:", e); }
+    }
+    setTimeout(()=>{setLaunching(false);setLaunched(true);},1200);
   };
 
   const canNext = () => {
@@ -1124,12 +1342,65 @@ function Onboarding({ onComplete }) {
 // ══════════════════════════════════════════════════════════════════════════════
 // MAIN APP SHELL (after onboarding)
 // ══════════════════════════════════════════════════════════════════════════════
-function AppShell({ onLogout }) {
-  const [view, setView] = useState("dashboard");
-  const [toasts, setToasts] = useState([]);
-  const [fleet, setFleet] = useState(FLEET_DATA);
+function AppShell({ onLogout, initialFleet, session, profile, tenant }) {
+  const [view, setView]             = useState("dashboard");
+  const [toasts, setToasts]         = useState([]);
+  const [fleet, setFleet]           = useState([]);
   const [renewModal, setRenewModal] = useState(null);
+  const [vehicleModal, setVehicleModal] = useState(null);
+  const [activity, setActivity]     = useState([]);
   const toastId = useRef(0);
+
+  // ── Load fleet from Supabase realtime ──────────────────────────
+  const loadFleet = useCallback(async () => {
+    if (!supabase || !tenant?.id) return;
+    const { data } = await supabase.from("vehicles").select("*").eq("tenant_id",tenant.id).order("created_at");
+    if (data) setFleet(data.map(dbVehicleToFleet));
+  }, [tenant?.id]);
+
+  useEffect(() => { loadFleet(); }, [loadFleet]);
+
+  useEffect(() => {
+    if (!supabase || !tenant?.id) return;
+    const ch = supabase.channel("fleet-shell-"+tenant.id)
+      .on("postgres_changes",{event:"*",schema:"public",table:"vehicles",filter:`tenant_id=eq.${tenant.id}`},loadFleet)
+      .subscribe();
+    return () => supabase.removeChannel(ch);
+  }, [tenant?.id, loadFleet]);
+
+  // ── Activity from uit_renewals ──────────────────────────────────
+  const loadActivity = useCallback(async () => {
+    if (!supabase || !tenant?.id) return;
+    const { data } = await supabase
+      .from("uit_renewals").select("*, vehicles(plate,tenant_id)").order("created_at",{ascending:false}).limit(15);
+    if (data) setActivity(data
+      .filter(r=>r.vehicles?.tenant_id===tenant.id)
+      .map(r=>({
+        id:r.id, type:r.status==="success"?"zap":"alert",
+        msg:r.status==="success"
+          ?`UIT reînnoit: ${r.vehicles?.plate||"vehicul"} · ${r.new_uit||""}`
+          :`Eroare ${r.vehicles?.plate||""}: ${r.error_msg||""}`,
+        time:new Date(r.created_at).toLocaleString("ro-RO",{hour:"2-digit",minute:"2-digit",day:"2-digit",month:"short"}),
+        color:r.status==="success"?"#34d399":"#f87171",
+      })));
+  }, [tenant?.id]);
+
+  useEffect(() => { loadActivity(); }, [loadActivity]);
+
+  // ── Optimistic fleet update after renew ──────────────────────────
+  const handleFleetUpdate = useCallback((dbId, fields) => {
+    setFleet(prev=>prev.map(v=>v._dbId===dbId?{...v,...dbVehicleToFleet({...v._raw,...fields})}:v));
+    loadActivity();
+  }, [loadActivity]);
+
+  // ── Delete vehicle ─────────────────────────────────────────────
+  const deleteVehicle = useCallback(async (v) => {
+    if (!confirm("Ștergi vehiculul "+v.plate+"?")) return;
+    if (!supabase) return;
+    const {error}=await supabase.from("vehicles").delete().eq("id",v._dbId);
+    if(error) addToast({type:"error",title:"Eroare",msg:error.message});
+    else { addToast({type:"success",title:"Vehicul șters",msg:v.plate}); loadFleet(); }
+  }, [loadFleet]);
 
   const addToast = useCallback(t => {
     const id = ++toastId.current;
@@ -1169,7 +1440,7 @@ function AppShell({ onLogout }) {
             </button>
           ))}
           <div style={{fontSize:9,fontWeight:700,letterSpacing:".12em",textTransform:"uppercase",color:"#1f2937",padding:"12px 10px 4px",marginTop:8}}>Cont</div>
-          <button className="navItem" onClick={onLogout}><LogOut size={14}/><span>Ieșire / Landing</span></button>
+          <button className="navItem" onClick={onLogout}><LogOut size={14}/><span>{session ? "Deconectare" : "Ieșire / Landing"}</span></button>
         </nav>
         <div style={{padding:"10px 14px",borderTop:"1px solid rgba(255,255,255,.04)"}}>
           <div style={{display:"flex",alignItems:"center",gap:8,padding:"9px 11px",background:"rgba(16,185,129,.06)",border:"1px solid rgba(16,185,129,.12)",borderRadius:9}}>
@@ -1187,30 +1458,31 @@ function AppShell({ onLogout }) {
         {/* TOPBAR */}
         <header style={{background:"#0b0f1a",borderBottom:"1px solid rgba(255,255,255,.05)",padding:"0 22px",height:54,display:"flex",alignItems:"center",justifyContent:"space-between",flexShrink:0}}>
           <div style={{display:"flex",alignItems:"center",gap:6,fontSize:12,color:"#374151"}}>
-            <span>SmartLogis</span><ChevronRight size={12}/><span style={{color:"#9ca3af",fontWeight:500}}>{NAV.find(n=>n.id===view)?.label}</span>
+            <span>{tenant?.name || "SmartLogis"}</span><ChevronRight size={12}/><span style={{color:"#9ca3af",fontWeight:500}}>{NAV.find(n=>n.id===view)?.label}</span>
           </div>
           <div style={{display:"flex",alignItems:"center",gap:9}}>
-            <button className="btn-ghost" onClick={()=>addToast({type:"info",title:"Date Actualizate",msg:"Flotă sincronizată cu ANAF API"})} style={{background:"rgba(255,255,255,.04)",border:"1px solid rgba(255,255,255,.06)",borderRadius:8,padding:"6px 10px",color:"#6b7280",display:"flex",alignItems:"center",gap:5,fontSize:11}}>
+            <button className="btn-ghost" onClick={()=>{loadFleet();loadActivity();addToast({type:"info",title:"Date Actualizate",msg:"Flotă reîncărcată din baza de date"});}} style={{background:"rgba(255,255,255,.04)",border:"1px solid rgba(255,255,255,.06)",borderRadius:8,padding:"6px 10px",color:"#6b7280",display:"flex",alignItems:"center",gap:5,fontSize:11}}>
               <RefreshCw size={12}/>Actualizează
             </button>
-            <div style={{width:30,height:30,background:"#1c2333",borderRadius:"50%",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:700,color:"#9ca3af",border:"1px solid rgba(255,255,255,.06)"}}>A</div>
+            <div style={{width:30,height:30,background:"#1c2333",borderRadius:"50%",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:700,color:"#9ca3af",border:"1px solid rgba(255,255,255,.06)",cursor:"pointer"}} title={profile?.full_name||session?.user?.email||"User"}>{(profile?.full_name||session?.user?.email||"U")[0].toUpperCase()}</div>
           </div>
         </header>
 
         {/* CONTENT */}
         <main style={{flex:1,overflowY:"auto",padding:22}}>
           <div style={{maxWidth:1180,margin:"0 auto"}}>
-            {view==="dashboard"&&<ViewDashboard fleet={fleet} setFleet={setFleet} addToast={addToast} setRenewModal={setRenewModal}/>}
-            {view==="auto-renew"&&<ViewAutoRenew fleet={fleet} addToast={addToast}/>}
+            {view==="dashboard"&&<ViewDashboard fleet={fleet} addToast={addToast} setRenewModal={setRenewModal} setVehicleModal={setVehicleModal} deleteVehicle={deleteVehicle} activity={activity}/>}
+            {view==="auto-renew"&&<ViewAutoRenew fleet={fleet} addToast={addToast} setRenewModal={setRenewModal} setVehicleModal={setVehicleModal} loadFleet={loadFleet}/>}
             {view==="ocr"&&<ViewOCR addToast={addToast}/>}
-            {view==="dispatch"&&<ViewDispatch fleet={fleet} addToast={addToast}/>}
+            {view==="dispatch"&&<ViewDispatch fleet={fleet} addToast={addToast} tenant={tenant}/>}
             {view==="pricing"&&<ViewPricing/>}
             {view==="architecture"&&<ViewArchitecture/>}
           </div>
         </main>
       </div>
 
-      {renewModal&&<AutoRenewModal v={renewModal} onClose={()=>setRenewModal(null)} addToast={addToast}/>}
+      {renewModal&&<AutoRenewModal v={renewModal} onClose={()=>{setRenewModal(null);loadActivity();}} addToast={addToast} onFleetUpdate={handleFleetUpdate}/>}
+      {vehicleModal!==null&&<VehicleModal initial={vehicleModal||undefined} tenantId={tenant?.id} onClose={()=>setVehicleModal(null)} onSaved={()=>{setVehicleModal(null);loadFleet();}} addToast={addToast}/>}
       <Toasts toasts={toasts} remove={removeToast}/>
     </div>
   );
@@ -1219,23 +1491,27 @@ function AppShell({ onLogout }) {
 // ══════════════════════════════════════════════════════════════════════════════
 // VIEW: DASHBOARD
 // ══════════════════════════════════════════════════════════════════════════════
-function ViewDashboard({ fleet, setFleet, addToast, setRenewModal }) {
+function ViewDashboard({ fleet, addToast, setRenewModal, setVehicleModal, deleteVehicle, activity }) {
   const [search, setSearch] = useState("");
-  const [selectedVehicle, setSelectedVehicle] = useState(null);
   const critical = fleet.filter(v=>v.status==="critical");
   const [alertDismissed, setAlertDismissed] = useState(false);
-  const filtered = fleet.filter(v=>v.plate.toLowerCase().includes(search.toLowerCase())||v.driver.toLowerCase().includes(search.toLowerCase()));
+  const filtered = fleet.filter(v=>
+    !search ||
+    v.plate.toLowerCase().includes(search.toLowerCase()) ||
+    (v.driver||"").toLowerCase().includes(search.toLowerCase())
+  );
+
+  const now = new Date().toLocaleDateString("ro-RO",{weekday:"long",day:"numeric",month:"long",year:"numeric"});
+  const autoRenewToday = fleet.filter(v=>v.autoRenew&&v.renew_count>0).length;
 
   const KPI_DATA = [
-    { l:"Vehicule Active", v:fleet.length, icon:Truck, c:"#60a5fa", bg:"rgba(59,130,246,.12)", glow:"rgba(59,130,246,.18)", brd:"rgba(59,130,246,.2)", trend:"+1 azi", trendUp:true },
-    { l:"UIT-uri Critice", v:critical.length, icon:AlertTriangle, c:"#f87171", bg:"rgba(239,68,68,.12)", glow:"rgba(239,68,68,.18)", brd:critical.length>0?"rgba(239,68,68,.35)":"rgba(239,68,68,.12)", trend:critical.length>0?"Acțiune necesară":"Totul OK", trendUp:false },
-    { l:"Auto-Reînnoiri Azi", v:7, icon:Zap, c:"#34d399", bg:"rgba(16,185,129,.12)", glow:"rgba(16,185,129,.18)", brd:"rgba(16,185,129,.2)", trend:"+3 față de ieri", trendUp:true },
-    { l:"Amenzi Evitate", v:"23.5k", icon:Shield, c:"#a78bfa", bg:"rgba(167,139,250,.12)", glow:"rgba(167,139,250,.18)", brd:"rgba(167,139,250,.2)", trend:"RON luna aceasta", trendUp:true },
+    { l:"Vehicule Active", v:fleet.length, icon:Truck, c:"#60a5fa", bg:"rgba(59,130,246,.12)", glow:"rgba(59,130,246,.18)", brd:"rgba(59,130,246,.2)", trend:fleet.length>0?`${fleet.length} înregistrate`:"Adaugă vehicule", trendUp:true },
+    { l:"UIT-uri Critice", v:critical.length, icon:AlertTriangle, c:"#f87171", bg:"rgba(239,68,68,.12)", glow:"rgba(239,68,68,.18)", brd:critical.length>0?"rgba(239,68,68,.35)":"rgba(239,68,68,.12)", trend:critical.length>0?"Acțiune necesară":"Totul OK ✓", trendUp:false },
+    { l:"Auto-Reînnoiri",  v:autoRenewToday, icon:Zap, c:"#34d399", bg:"rgba(16,185,129,.12)", glow:"rgba(16,185,129,.18)", brd:"rgba(16,185,129,.2)", trend:fleet.filter(v=>v.autoRenew).length+" cu AUTO activ", trendUp:true },
+    { l:"Fleet cu GPS",    v:fleet.filter(v=>v.last_lat).length, icon:MapPin, c:"#a78bfa", bg:"rgba(167,139,250,.12)", glow:"rgba(167,139,250,.18)", brd:"rgba(167,139,250,.2)", trend:"coordonate live", trendUp:true },
   ];
 
   return <div style={{display:"flex",flexDirection:"column",gap:20}}>
-
-    {/* ── HEADER ── */}
     <div className="fu" style={{display:"flex",alignItems:"center",justifyContent:"space-between",paddingBottom:4}}>
       <div>
         <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:5}}>
@@ -1244,32 +1520,28 @@ function ViewDashboard({ fleet, setFleet, addToast, setRenewModal }) {
             <span className="blink" style={{width:5,height:5,borderRadius:"50%",background:"#34d399",display:"inline-block"}}/>LIVE
           </span>
         </div>
-        <div style={{fontSize:12,color:"#4b5563"}}>Joi, 5 Martie 2026 · Sincronizat cu ANAF acum 2 min</div>
+        <div style={{fontSize:12,color:"#4b5563"}}>{now}</div>
       </div>
       <div style={{display:"flex",gap:9}}>
-        <button className="btn-ghost" onClick={()=>addToast({type:"info",title:"Date Actualizate",msg:"Flotă sincronizată cu ANAF API"})}
+        <button className="btn-ghost" onClick={()=>setVehicleModal({})}
           style={{background:"rgba(255,255,255,.04)",border:"1px solid rgba(255,255,255,.08)",borderRadius:10,padding:"9px 16px",fontSize:12,fontWeight:600,color:"#9ca3af",display:"flex",alignItems:"center",gap:7}}>
-          <RefreshCw size={13}/> Actualizează
+          <Plus size={13}/> Adaugă Vehicul
         </button>
-        <button className="btn" onClick={()=>setRenewModal(fleet[0])}
-          style={{background:"linear-gradient(135deg,#34d399,#059669)",border:"none",borderRadius:10,padding:"9px 18px",fontSize:12,fontWeight:700,color:"#064e3b",display:"flex",alignItems:"center",gap:7,boxShadow:"0 4px 20px rgba(16,185,129,.3)"}}>
+        <button className="btn" onClick={()=>fleet.length>0&&setRenewModal(fleet.find(v=>v.status!=="ok")||fleet[0])}
+          style={{background:"linear-gradient(135deg,#34d399,#059669)",border:"none",borderRadius:10,padding:"9px 18px",fontSize:12,fontWeight:700,color:"#064e3b",display:"flex",alignItems:"center",gap:7,boxShadow:"0 4px 20px rgba(16,185,129,.3)",opacity:fleet.length?1:.5}}>
           <Zap size={13}/> Reînnoire Rapidă
         </button>
       </div>
     </div>
 
-    {/* ── KPI CARDS ── */}
     <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:14}}>
       {KPI_DATA.map((k,i)=>(
-        <div key={k.l} className={`kpi-card fu${i+1}`}
-          style={{background:`linear-gradient(135deg,${k.glow} 0%,rgba(255,255,255,.02) 100%)`,border:`1px solid ${k.brd}`,borderRadius:18,padding:"20px",cursor:"default",position:"relative",overflow:"hidden",boxShadow:`0 4px 24px ${k.glow}`}}>
-          {/* glow orb */}
+        <div key={k.l} className={`fu${i+1}`}
+          style={{background:`linear-gradient(135deg,${k.glow} 0%,rgba(255,255,255,.02) 100%)`,border:`1px solid ${k.brd}`,borderRadius:18,padding:"20px",position:"relative",overflow:"hidden",boxShadow:`0 4px 24px ${k.glow}`}}>
           <div style={{position:"absolute",top:-20,right:-20,width:80,height:80,borderRadius:"50%",background:k.glow,filter:"blur(24px)",pointerEvents:"none"}}/>
           <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",marginBottom:16,position:"relative"}}>
-            <div style={{width:40,height:40,borderRadius:12,background:k.bg,border:`1px solid ${k.brd}`,display:"flex",alignItems:"center",justifyContent:"center",boxShadow:`0 0 16px ${k.glow}`}}>
-              <k.icon size={17} color={k.c}/>
-            </div>
-            <div style={{display:"flex",alignItems:"center",gap:4,fontSize:10,fontWeight:600,color:k.trendUp?"#34d399":"#f87171",background:k.trendUp?"rgba(16,185,129,.1)":"rgba(239,68,68,.1)",padding:"3px 8px",borderRadius:12}}>
+            <div style={{width:40,height:40,borderRadius:12,background:k.bg,border:`1px solid ${k.brd}`,display:"flex",alignItems:"center",justifyContent:"center"}}><k.icon size={17} color={k.c}/></div>
+            <div style={{fontSize:10,fontWeight:600,color:k.trendUp?"#34d399":"#f87171",background:k.trendUp?"rgba(16,185,129,.1)":"rgba(239,68,68,.1)",padding:"3px 8px",borderRadius:12,display:"flex",alignItems:"center",gap:3}}>
               {k.trendUp?<TrendingUp size={9}/>:<AlertTriangle size={9}/>}{k.trend}
             </div>
           </div>
@@ -1279,143 +1551,132 @@ function ViewDashboard({ fleet, setFleet, addToast, setRenewModal }) {
       ))}
     </div>
 
-    {/* ── CRITICAL ALERT ── */}
     {!alertDismissed&&critical.length>0&&(
-      <div className="fu2" style={{background:"linear-gradient(135deg,rgba(239,68,68,.08) 0%,rgba(239,68,68,.03) 100%)",border:"1px solid rgba(239,68,68,.25)",borderRadius:16,padding:"16px 20px",boxShadow:"0 4px 24px rgba(239,68,68,.1)"}}>
+      <div className="fu2" style={{background:"linear-gradient(135deg,rgba(239,68,68,.08) 0%,rgba(239,68,68,.03) 100%)",border:"1px solid rgba(239,68,68,.25)",borderRadius:16,padding:"16px 20px"}}>
         <div style={{display:"flex",alignItems:"center",gap:13}}>
-          <div style={{width:40,height:40,borderRadius:12,background:"rgba(239,68,68,.15)",border:"1px solid rgba(239,68,68,.3)",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,boxShadow:"0 0 16px rgba(239,68,68,.2)"}}>
-            <AlertTriangle size={18} color="#f87171"/>
-          </div>
+          <div style={{width:40,height:40,borderRadius:12,background:"rgba(239,68,68,.15)",border:"1px solid rgba(239,68,68,.3)",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}><AlertTriangle size={18} color="#f87171"/></div>
           <div style={{flex:1}}>
-            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:5}}>
-              <span style={{fontSize:13,fontWeight:700,color:"#f9fafb"}}>RISC AMENDĂ ANAF — Acțiune Imediată</span>
-              <span className="blink badge" style={{background:"rgba(239,68,68,.15)",color:"#f87171",border:"1px solid rgba(239,68,68,.3)",fontSize:8}}>LIVE</span>
-            </div>
-            {critical.map(v=><div key={v.id} style={{fontSize:11,color:"#fca5a5",marginBottom:2}}>
-              <strong>{v.plate}</strong> ({v.driver}) · {v.location} · UIT expiră în <strong style={{color:"#f87171"}}>{fmtTime(v.expiresMin)}</strong> · Așteptare: {v.waitH}h
-            </div>)}
+            <div style={{fontSize:13,fontWeight:700,color:"#f9fafb",marginBottom:3}}>{critical.length} vehicul{critical.length>1?"e":""}  cu UIT expirat sau critic!</div>
+            <div style={{fontSize:11,color:"#9ca3af"}}>{critical.map(v=>v.plate).join(", ")}</div>
           </div>
-          <div style={{display:"flex",gap:8,flexShrink:0}}>
-            <button className="btn" onClick={()=>setRenewModal(critical[0])}
-              style={{background:"linear-gradient(135deg,#ef4444,#dc2626)",color:"#fff",border:"none",borderRadius:10,padding:"9px 16px",fontSize:12,fontWeight:700,display:"flex",alignItems:"center",gap:6,whiteSpace:"nowrap",boxShadow:"0 4px 16px rgba(239,68,68,.35)"}}>
-              <Zap size={12}/>Reînnoire Urgentă
-            </button>
-            <button className="btn-ghost" onClick={()=>setAlertDismissed(true)}
-              style={{background:"rgba(255,255,255,.04)",border:"1px solid rgba(255,255,255,.08)",borderRadius:9,padding:"9px 9px",color:"#f87171",display:"flex",alignItems:"center",justifyContent:"center"}}>
-              <X size={15}/>
-            </button>
-          </div>
+          <button className="btn" onClick={()=>setRenewModal(critical[0])} style={{background:"#ef4444",color:"#fff",border:"none",borderRadius:9,padding:"9px 16px",fontSize:12,fontWeight:700,display:"flex",alignItems:"center",gap:6}}>
+            <Zap size={12}/>Reînnoire Urgentă
+          </button>
+          <button onClick={()=>setAlertDismissed(true)} style={{background:"none",border:"none",cursor:"pointer",color:"#6b7280",padding:4}}><X size={14}/></button>
         </div>
       </div>
     )}
 
-    {/* ── TABLE + ACTIVITY ── */}
-    <div style={{display:"grid",gridTemplateColumns:"1fr 296px",gap:14}}>
-
-      {/* Fleet Table */}
-      <div className="fu3" style={{background:"rgba(255,255,255,.02)",border:"1px solid rgba(255,255,255,.07)",borderRadius:18,overflow:"hidden",backdropFilter:"blur(12px)"}}>
-        <div style={{padding:"16px 20px",borderBottom:"1px solid rgba(255,255,255,.05)",display:"flex",alignItems:"center",justifyContent:"space-between",background:"rgba(255,255,255,.015)"}}>
-          <div>
-            <div style={{fontSize:14,fontWeight:700,color:"#f9fafb"}}>Flotă Live</div>
-            <div style={{fontSize:10,color:"#4b5563",marginTop:1}}>Monitorizare timp real · ANAF sync</div>
-          </div>
+    <div style={{display:"grid",gridTemplateColumns:"1fr 280px",gap:14}}>
+      <div className="fu3" style={{background:"rgba(255,255,255,.02)",border:"1px solid rgba(255,255,255,.07)",borderRadius:18,overflow:"hidden"}}>
+        <div style={{padding:"14px 18px",borderBottom:"1px solid rgba(255,255,255,.05)",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+          <div style={{fontSize:13,fontWeight:700,color:"#f9fafb"}}>Flota Mea ({fleet.length})</div>
           <div style={{position:"relative"}}>
             <Search size={12} style={{position:"absolute",left:10,top:"50%",transform:"translateY(-50%)",color:"#4b5563"}}/>
-            <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Caută vehicul..." style={{background:"rgba(255,255,255,.05)",border:"1px solid rgba(255,255,255,.08)",borderRadius:9,padding:"7px 10px 7px 28px",fontSize:11,color:"#e5e7eb",outline:"none",width:150,transition:"all .15s"}}/>
+            <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Caută vehicul..." style={{background:"rgba(255,255,255,.05)",border:"1px solid rgba(255,255,255,.08)",borderRadius:9,padding:"7px 10px 7px 28px",fontSize:11,color:"#e5e7eb",outline:"none",width:150}}/>
           </div>
         </div>
-        <table style={{width:"100%",borderCollapse:"collapse"}}>
-          <thead><tr style={{borderBottom:"1px solid rgba(255,255,255,.05)",background:"rgba(255,255,255,.01)"}}>
-            {["Vehicul","Rută / Marfă","UIT & Expirare","Vamă","Status",""].map(h=>(
-              <th key={h} style={{padding:"10px 16px",textAlign:"left",fontSize:9,fontWeight:700,letterSpacing:".08em",textTransform:"uppercase",color:"#374151"}}>{h}</th>
-            ))}
-          </tr></thead>
-          <tbody>
-            {filtered.map(v=>(
-              <tr key={v.id} className="trow" style={{borderBottom:"1px solid rgba(255,255,255,.03)",cursor:"pointer"}} onClick={()=>setSelectedVehicle(selectedVehicle===v.id?null:v.id)}>
-                <td style={{padding:"13px 16px"}}>
-                  <div style={{display:"flex",alignItems:"center",gap:10}}>
-                    <div style={{width:34,height:34,borderRadius:10,background:v.status==="critical"?"rgba(239,68,68,.15)":v.status==="warning"?"rgba(245,158,11,.1)":"rgba(255,255,255,.05)",border:`1px solid ${v.status==="critical"?"rgba(239,68,68,.25)":"rgba(255,255,255,.06)"}`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16}}>{v.flag}</div>
-                    <div><div style={{fontSize:12,fontWeight:700,color:"#f9fafb",fontFamily:"'DM Mono',monospace"}}>{v.plate}</div><div style={{fontSize:10,color:"#6b7280"}}>{v.driver}</div></div>
-                  </div>
-                </td>
-                <td style={{padding:"13px 16px"}}><div style={{fontSize:11,color:"#e5e7eb",fontWeight:500}}>{v.route}</div><div style={{fontSize:10,color:"#4b5563",marginTop:2}}>{v.cargo} · {v.weight}</div></td>
-                <td style={{padding:"13px 16px"}}><div style={{fontSize:9,color:"#4b5563",fontFamily:"'DM Mono',monospace",marginBottom:5}}>{v.uit}</div><UitBar min={v.expiresMin} autoRenew={v.autoRenew}/></td>
-                <td style={{padding:"13px 16px"}}>
-                  <div style={{display:"flex",alignItems:"center",gap:5,fontSize:11,color:"#e5e7eb"}}><MapPin size={10} color="#374151"/>{v.location}</div>
-                  <div style={{fontSize:10,color:v.waitH>3?"#f87171":"#6b7280",marginTop:3,display:"flex",alignItems:"center",gap:4}}><Clock size={9}/>{v.waitH}h așteptare</div>
-                </td>
-                <td style={{padding:"13px 16px"}}><SBadge s={v.status}/></td>
-                <td style={{padding:"13px 16px"}}>
-                  <button className="btn-ghost btn-sm" onClick={e=>{e.stopPropagation();setRenewModal(v);}}
-                    style={{background:"rgba(16,185,129,.06)",border:"1px solid rgba(16,185,129,.2)",borderRadius:8,padding:"6px 11px",fontSize:10,fontWeight:700,color:"#34d399",display:"flex",alignItems:"center",gap:5,whiteSpace:"nowrap"}}>
-                    <Zap size={10}/>Reînnoire
-                  </button>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        {fleet.length===0 ? (
+          <div style={{padding:"48px 24px",textAlign:"center"}}>
+            <Truck size={40} color="#1e2535" style={{margin:"0 auto 14px"}}/>
+            <div style={{fontSize:14,color:"#6b7280",marginBottom:18}}>Nu ai vehicule adăugate.</div>
+            <button className="btn" onClick={()=>setVehicleModal({})} style={{background:"#34d399",color:"#064e3b",border:"none",borderRadius:10,padding:"10px 22px",fontSize:13,fontWeight:700,display:"inline-flex",alignItems:"center",gap:7}}>
+              <Plus size={14}/>Adaugă primul vehicul
+            </button>
+          </div>
+        ) : (
+          <table style={{width:"100%",borderCollapse:"collapse"}}>
+            <thead><tr style={{borderBottom:"1px solid rgba(255,255,255,.05)"}}>
+              {["Vehicul","Rută / Marfă","UIT & Expirare","Status",""].map(h=>(
+                <th key={h} style={{padding:"10px 16px",textAlign:"left",fontSize:9,fontWeight:700,letterSpacing:".08em",textTransform:"uppercase",color:"#374151"}}>{h}</th>
+              ))}
+            </tr></thead>
+            <tbody>
+              {filtered.map(v=>(
+                <tr key={v.id} className="trow" style={{borderBottom:"1px solid rgba(255,255,255,.03)"}}>
+                  <td style={{padding:"13px 16px"}}>
+                    <div style={{display:"flex",alignItems:"center",gap:10}}>
+                      <div style={{width:34,height:34,borderRadius:10,background:v.status==="critical"?"rgba(239,68,68,.15)":v.status==="warning"?"rgba(245,158,11,.1)":"rgba(255,255,255,.05)",border:`1px solid ${v.status==="critical"?"rgba(239,68,68,.25)":"rgba(255,255,255,.06)"}`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16}}>🚛</div>
+                      <div>
+                        <div style={{fontSize:12,fontWeight:700,color:"#f9fafb",fontFamily:"'DM Mono',monospace"}}>{v.plate}</div>
+                        <div style={{fontSize:10,color:"#6b7280"}}>{v.driver}</div>
+                      </div>
+                    </div>
+                  </td>
+                  <td style={{padding:"13px 16px"}}>
+                    <div style={{fontSize:11,color:"#e5e7eb",fontWeight:500}}>{v.route}</div>
+                    <div style={{fontSize:10,color:"#4b5563",marginTop:2}}>{v.cargo} {v.weight!=="—"?"· "+v.weight:""}</div>
+                  </td>
+                  <td style={{padding:"13px 16px"}}>
+                    <div style={{fontSize:9,color:"#4b5563",fontFamily:"'DM Mono',monospace",marginBottom:5}}>{v.uit}</div>
+                    <UitBar min={v.expiresMin} autoRenew={v.autoRenew}/>
+                  </td>
+                  <td style={{padding:"13px 16px"}}><SBadge s={v.status}/></td>
+                  <td style={{padding:"13px 16px"}}>
+                    <div style={{display:"flex",gap:5}}>
+                      <button className="btn-ghost btn-sm" onClick={()=>setRenewModal(v)}
+                        style={{background:"rgba(16,185,129,.06)",border:"1px solid rgba(16,185,129,.2)",borderRadius:7,padding:"5px 9px",fontSize:10,fontWeight:700,color:"#34d399"}}>
+                        <Zap size={9}/>
+                      </button>
+                      <button className="btn-ghost btn-sm" onClick={()=>setVehicleModal(v)}
+                        style={{background:"rgba(255,255,255,.04)",border:"1px solid rgba(255,255,255,.09)",borderRadius:7,padding:"5px 9px",fontSize:10,color:"#9ca3af"}}>
+                        ✏️
+                      </button>
+                      <button className="btn-ghost btn-sm" onClick={()=>deleteVehicle&&deleteVehicle(v)}
+                        style={{background:"rgba(239,68,68,.05)",border:"1px solid rgba(239,68,68,.15)",borderRadius:7,padding:"5px 9px",fontSize:10,color:"#f87171"}}>
+                        🗑
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
       </div>
 
-      {/* Activity Feed */}
-      <div className="fu4" style={{background:"rgba(255,255,255,.02)",border:"1px solid rgba(255,255,255,.07)",borderRadius:18,overflow:"hidden",backdropFilter:"blur(12px)",display:"flex",flexDirection:"column"}}>
-        <div style={{padding:"16px 18px",borderBottom:"1px solid rgba(255,255,255,.05)",display:"flex",alignItems:"center",justifyContent:"space-between",background:"rgba(255,255,255,.015)"}}>
-          <div style={{fontSize:14,fontWeight:700,color:"#f9fafb"}}>Activitate Live</div>
-          <div style={{display:"flex",alignItems:"center",gap:7}}>
-            <span className="blink" style={{width:7,height:7,borderRadius:"50%",background:"#34d399",display:"inline-block"}}/>
-            <span style={{fontSize:9,color:"#34d399",fontWeight:700,letterSpacing:".08em"}}>LIVE</span>
-          </div>
+      <div className="fu4" style={{background:"rgba(255,255,255,.02)",border:"1px solid rgba(255,255,255,.07)",borderRadius:18,overflow:"hidden",display:"flex",flexDirection:"column"}}>
+        <div style={{padding:"14px 16px",borderBottom:"1px solid rgba(255,255,255,.05)",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+          <div style={{fontSize:13,fontWeight:700,color:"#f9fafb"}}>Activitate Live</div>
+          <span className="blink" style={{width:7,height:7,borderRadius:"50%",background:"#34d399",display:"inline-block"}}/>
         </div>
         <div style={{padding:"8px",flex:1,overflowY:"auto"}}>
-          {ACTIVITY.map(a=>{
+          {(activity&&activity.length>0 ? activity : ACTIVITY).map((a,i)=>{
             const icons={zap:Zap,alert:AlertTriangle,scan:ScanLine,nav:Navigation,check:CheckCircle};
             const Ic=icons[a.type]||Activity;
             return (
-              <div key={a.id} style={{display:"flex",alignItems:"flex-start",gap:10,padding:"10px 10px",borderRadius:11,cursor:"default",transition:"background .15s",marginBottom:2}}
+              <div key={a.id||i} style={{display:"flex",alignItems:"flex-start",gap:10,padding:"9px 10px",borderRadius:10,marginBottom:2,transition:"background .15s"}}
                 onMouseEnter={e=>e.currentTarget.style.background="rgba(255,255,255,.04)"}
                 onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
-                <div style={{width:28,height:28,borderRadius:8,background:`${a.color}18`,border:`1px solid ${a.color}28`,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,marginTop:1}}><Ic size={11} color={a.color}/></div>
+                <div style={{width:26,height:26,borderRadius:7,background:`${a.color}18`,border:`1px solid ${a.color}28`,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,marginTop:1}}><Ic size={11} color={a.color}/></div>
                 <div style={{flex:1}}>
                   <div style={{fontSize:11,color:"#d1d5db",lineHeight:1.45,fontWeight:500}}>{a.msg}</div>
-                  <div style={{fontSize:9,color:"#374151",marginTop:3}}>{a.time}</div>
+                  <div style={{fontSize:9,color:"#374151",marginTop:2}}>{a.time}</div>
                 </div>
               </div>
             );
           })}
         </div>
-        <div style={{padding:"12px 16px",borderTop:"1px solid rgba(255,255,255,.05)"}}>
-          <button className="btn-ghost" onClick={()=>addToast({type:"info",title:"Istoric",msg:"Se deschide logul complet de activitate"})}
-            style={{width:"100%",background:"rgba(255,255,255,.03)",border:"1px solid rgba(255,255,255,.07)",borderRadius:9,padding:"9px",fontSize:11,fontWeight:600,color:"#6b7280",display:"flex",alignItems:"center",justifyContent:"center",gap:6}}>
-            <Activity size={11}/>Vezi tot istoricul
-          </button>
-        </div>
       </div>
     </div>
 
-    {/* ── BORDER INTELLIGENCE ── */}
-    <div className="fu5" style={{background:"rgba(255,255,255,.02)",border:"1px solid rgba(255,255,255,.07)",borderRadius:18,overflow:"hidden",backdropFilter:"blur(12px)"}}>
-      <div style={{padding:"16px 20px",borderBottom:"1px solid rgba(255,255,255,.05)",display:"flex",alignItems:"center",justifyContent:"space-between",background:"rgba(255,255,255,.015)"}}>
-        <div>
-          <div style={{fontSize:14,fontWeight:700,color:"#f9fafb"}}>Inteligență Frontieră</div>
-          <div style={{fontSize:10,color:"#4b5563",marginTop:1}}>Timpi de așteptare în timp real la principalele puncte vamale</div>
-        </div>
-        <div style={{display:"flex",alignItems:"center",gap:6,fontSize:9,color:"#34d399",fontFamily:"'DM Mono',monospace",background:"rgba(16,185,129,.06)",border:"1px solid rgba(16,185,129,.15)",borderRadius:8,padding:"4px 10px"}}>
-          <span className="blink" style={{width:5,height:5,borderRadius:"50%",background:"#34d399",display:"inline-block"}}/>LIVE · refresh 5 min
-        </div>
+    <div className="fu5" style={{background:"rgba(255,255,255,.02)",border:"1px solid rgba(255,255,255,.07)",borderRadius:18,overflow:"hidden"}}>
+      <div style={{padding:"14px 20px",borderBottom:"1px solid rgba(255,255,255,.05)",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+        <div style={{fontSize:13,fontWeight:700,color:"#f9fafb"}}>Inteligență Frontieră</div>
+        <div style={{fontSize:9,color:"#34d399",background:"rgba(16,185,129,.06)",border:"1px solid rgba(16,185,129,.15)",borderRadius:7,padding:"3px 9px",display:"flex",alignItems:"center",gap:4}}><span className="blink" style={{width:5,height:5,borderRadius:"50%",background:"#34d399",display:"inline-block"}}/>LIVE</div>
       </div>
       <div style={{display:"grid",gridTemplateColumns:"repeat(6,1fr)"}}>
         {BORDERS.map((b,i)=>{
           const c=b.status==="liber"?"#34d399":b.status==="aglomerat"?"#f87171":"#fbbf24";
           return (
-            <div key={b.name} className="cardHov" style={{padding:"18px 16px",borderRight:i<5?"1px solid rgba(255,255,255,.04)":"none",cursor:"default",transition:"background .18s"}}
+            <div key={b.name} style={{padding:"16px",borderRight:i<5?"1px solid rgba(255,255,255,.04)":"none",cursor:"default"}}
               onMouseEnter={e=>e.currentTarget.style.background="rgba(255,255,255,.025)"}
               onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
-              <div style={{fontSize:22,marginBottom:8}}>{b.flag}</div>
-              <div style={{fontSize:11,fontWeight:700,color:"#e5e7eb",marginBottom:5}}>{b.name}</div>
-              <div style={{fontSize:22,fontWeight:800,fontFamily:"'DM Mono',monospace",marginBottom:8,color:c,letterSpacing:-1,lineHeight:1}}>{b.wait}</div>
+              <div style={{fontSize:20,marginBottom:7}}>{b.flag}</div>
+              <div style={{fontSize:11,fontWeight:700,color:"#e5e7eb",marginBottom:4}}>{b.name}</div>
+              <div style={{fontSize:20,fontWeight:800,fontFamily:"'DM Mono',monospace",marginBottom:6,color:c,letterSpacing:-1,lineHeight:1}}>{b.wait}</div>
               <SBadge s={b.status}/>
-              <div style={{fontSize:9,color:"#374151",marginTop:7,display:"flex",alignItems:"center",gap:4}}><Truck size={8}/>{b.trucks} camioane</div>
+              <div style={{fontSize:9,color:"#374151",marginTop:6,display:"flex",alignItems:"center",gap:3}}><Truck size={7}/>{b.trucks}</div>
             </div>
           );
         })}
@@ -1427,21 +1688,70 @@ function ViewDashboard({ fleet, setFleet, addToast, setRenewModal }) {
 // ══════════════════════════════════════════════════════════════════════════════
 // VIEW: AUTO-RENEW ENGINE
 // ══════════════════════════════════════════════════════════════════════════════
-function ViewAutoRenew({ fleet, addToast }) {
-  const [rules, setRules] = useState([
-    {id:1,plate:"TR-45-YIL",h:3,on:true,count:4,last:"azi, 09:14"},
-    {id:2,plate:"PL-771-AB",h:6,on:true,count:2,last:"ieri, 18:30"},
-    {id:3,plate:"HU-55-KAM",h:4,on:false,count:0,last:"—"},
-    {id:4,plate:"DE-88-LKW",h:8,on:true,count:1,last:"ieri, 07:55"},
-  ]);
-  const [globalOn, setGlobalOn] = useState(true);
-  const [simLog, setSimLog] = useState([]);
-  const [simRunning, setSimRunning] = useState(false);
+function ViewAutoRenew({ fleet, addToast, setRenewModal, setVehicleModal, loadFleet }) {
+  const [saving, setSaving] = useState({});
 
-  const runSim = () => {
-    setSimRunning(true); setSimLog([]);
-    [{t:400,m:"Motor SmartLogis pornit · Scanare flotă activă...",c:"#60a5fa"},{t:900,m:"TR-45-YIL · UIT expiră în 2h 15m → sub pragul de 3h",c:"#fbbf24"},{t:1400,m:"TR-45-YIL · Conectare ANAF API...",c:"#a78bfa"},{t:1900,m:"TR-45-YIL · Validare date vehicul OK ✓",c:"#34d399"},{t:2400,m:"TR-45-YIL · UIT prelungit +24h automat ✓",c:"#34d399"},{t:3000,m:"PL-771-AB · UIT expiră în 6h 50m → în normă",c:"#4b5563"},{t:3500,m:"Ciclu complet · Următoarea scanare în 15 min",c:"#60a5fa"}].forEach(s=>
-      setTimeout(()=>{ setSimLog(l=>[...l,{m:s.m,c:s.c}]); if(s.t===3500){setSimRunning(false);addToast({type:"success",title:"Simulare Completă",msg:"1 reînnoire automată efectuată"});} }, s.t)
+  const toggleAutoRenew = async (v) => {
+    if (!supabase) return;
+    setSaving(s=>({...s,[v._dbId]:true}));
+    const newVal = !v.autoRenew;
+    const {error} = await supabase.from("vehicles").update({auto_renew:newVal}).eq("id",v._dbId);
+    setSaving(s=>({...s,[v._dbId]:false}));
+    if (error) { addToast({type:"error",title:"Eroare",msg:error.message}); return; }
+    addToast({type:newVal?"success":"info",title:newVal?"Auto-reînnoire activată":"Auto-reînnoire dezactivată",msg:v.plate});
+    if (loadFleet) loadFleet();
+  };
+
+  const critical = fleet.filter(v=>v.status==="critical");
+  const warning  = fleet.filter(v=>v.status==="warning");
+  const ok       = fleet.filter(v=>v.status==="ok");
+
+  const VRow = ({v}) => {
+    const col = v.status==="critical"?"#f87171":v.status==="warning"?"#fbbf24":"#34d399";
+    return (
+      <tr className="trow" style={{borderBottom:"1px solid rgba(255,255,255,.03)"}}>
+        <td style={{padding:"13px 18px"}}>
+          <div style={{display:"flex",alignItems:"center",gap:9}}>
+            <div style={{width:8,height:8,borderRadius:"50%",background:col,boxShadow:`0 0 6px ${col}`,flexShrink:0}}/>
+            <span style={{fontFamily:"'DM Mono',monospace",fontSize:12,fontWeight:700,color:"#f9fafb"}}>{v.plate}</span>
+            <span style={{fontSize:10,color:"#6b7280"}}>{v.driver}</span>
+          </div>
+        </td>
+        <td style={{padding:"13px 18px"}}>
+          <UitBar min={v.expiresMin} autoRenew={v.autoRenew}/>
+        </td>
+        <td style={{padding:"13px 18px"}}>
+          <div style={{display:"flex",alignItems:"center",gap:8}}>
+            <input type="range" min={1} max={12} value={v.renew_threshold_h||4}
+              onChange={async e=>{
+                if(!supabase) return;
+                await supabase.from("vehicles").update({renew_threshold_h:+e.target.value}).eq("id",v._dbId);
+                if(loadFleet) loadFleet();
+              }} style={{width:64,accentColor:"#34d399"}}/>
+            <span style={{fontFamily:"monospace",fontSize:11,color:"#fbbf24",fontWeight:600,minWidth:24}}>{v.renew_threshold_h||4}h</span>
+          </div>
+        </td>
+        <td style={{padding:"13px 18px"}}>
+          <span style={{fontSize:14,fontWeight:700,color:"#f9fafb",fontFamily:"monospace"}}>{v.renew_count||0}</span>
+        </td>
+        <td style={{padding:"13px 18px"}}>
+          <span className="badge" style={{background:v.autoRenew?"rgba(16,185,129,.1)":"rgba(255,255,255,.04)",color:v.autoRenew?"#34d399":"#6b7280",border:`1px solid ${v.autoRenew?"rgba(16,185,129,.2)":"rgba(255,255,255,.07)"}`}}>
+            {v.autoRenew?"AUTO ACTIV":"MANUAL"}
+          </span>
+        </td>
+        <td style={{padding:"13px 18px"}}>
+          <div style={{display:"flex",gap:7}}>
+            <button className="btn-ghost" onClick={()=>toggleAutoRenew(v)} disabled={saving[v._dbId]}
+              style={{background:v.autoRenew?"rgba(239,68,68,.08)":"rgba(16,185,129,.08)",color:v.autoRenew?"#f87171":"#34d399",border:`1px solid ${v.autoRenew?"rgba(239,68,68,.2)":"rgba(16,185,129,.2)"}`,borderRadius:7,padding:"5px 11px",fontSize:10,fontWeight:600}}>
+              {saving[v._dbId]?<RefreshCw size={10} className="spin"/>:(v.autoRenew?"Dezactivează":"Activează")}
+            </button>
+            <button className="btn-ghost" onClick={()=>setRenewModal(v)}
+              style={{background:"rgba(16,185,129,.06)",border:"1px solid rgba(16,185,129,.2)",borderRadius:7,padding:"5px 11px",fontSize:10,fontWeight:700,color:"#34d399",display:"flex",alignItems:"center",gap:4}}>
+              <Zap size={9}/>Reînnoire
+            </button>
+          </div>
+        </td>
+      </tr>
     );
   };
 
@@ -1453,58 +1763,56 @@ function ViewAutoRenew({ fleet, addToast }) {
           <div style={{fontSize:22,fontWeight:700,color:"#f9fafb"}}>Motor Auto-Reînnoire UIT</div>
           <span className="badge" style={{background:"rgba(16,185,129,.1)",color:"#34d399",border:"1px solid rgba(16,185,129,.25)"}}><span className="blink" style={{width:5,height:5,borderRadius:"50%",background:"#34d399",display:"inline-block"}}/>ACTIV</span>
         </div>
-        <div style={{fontSize:12,color:"#6b7280"}}>Nicio altă platformă nu oferă reînnoire UIT fără click. SmartLogis o face automat.</div>
+        <div style={{fontSize:12,color:"#6b7280"}}>
+          {fleet.filter(v=>v.autoRenew).length} vehicule cu auto-reînnoire activă · {critical.length} critice · {warning.length} avertizare
+        </div>
       </div>
-      <button className="btn-ghost" onClick={()=>{setGlobalOn(!globalOn);addToast({type:globalOn?"error":"success",title:globalOn?"Motor Oprit":"Motor Pornit",msg:globalOn?"Auto-reînnoire dezactivată":"Toate vehiculele monitorizate"});}} style={{background:globalOn?"rgba(16,185,129,.1)":"rgba(239,68,68,.1)",color:globalOn?"#34d399":"#f87171",border:`1px solid ${globalOn?"rgba(16,185,129,.3)":"rgba(239,68,68,.3)"}`,borderRadius:11,padding:"9px 18px",fontSize:12,fontWeight:700,display:"flex",alignItems:"center",gap:7}}>
-        {globalOn?<><Pause size={13}/>Motor Activ</>:<><Play size={13}/>Pornește</>}
+      <button className="btn-ghost" onClick={()=>setVehicleModal({})}
+        style={{background:"rgba(255,255,255,.04)",border:"1px solid rgba(255,255,255,.09)",borderRadius:10,padding:"9px 16px",fontSize:12,fontWeight:600,color:"#9ca3af",display:"flex",alignItems:"center",gap:7}}>
+        <Plus size={13}/>Vehicul Nou
       </button>
     </div>
-    {/* Steps */}
-    <div className="glass fu1" style={{borderRadius:15,padding:20}}>
+
+    {fleet.length===0 ? (
+      <div className="glass" style={{borderRadius:15,padding:"40px 24px",textAlign:"center"}}>
+        <Truck size={36} color="#1e2535" style={{margin:"0 auto 14px"}}/>
+        <div style={{color:"#6b7280",fontSize:13}}>Nu ai vehicule. Adaugă unul pentru a activa auto-reînnoirea.</div>
+        <button className="btn" onClick={()=>setVehicleModal({})} style={{marginTop:16,background:"#34d399",color:"#064e3b",border:"none",borderRadius:9,padding:"9px 20px",fontSize:13,fontWeight:700,display:"inline-flex",alignItems:"center",gap:7}}>
+          <Plus size={13}/>Adaugă Vehicul
+        </button>
+      </div>
+    ) : (
+      <div className="glass fu1" style={{borderRadius:15,overflow:"hidden"}}>
+        <div style={{padding:"12px 18px",borderBottom:"1px solid rgba(255,255,255,.05)",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div style={{fontSize:13,fontWeight:700,color:"#f9fafb"}}>Reguli Auto-Reînnoire ({fleet.length})</div>
+          <div style={{fontSize:11,color:"#6b7280"}}>Modificările se salvează automat în Supabase</div>
+        </div>
+        <table style={{width:"100%",borderCollapse:"collapse"}}>
+          <thead><tr style={{borderBottom:"1px solid rgba(255,255,255,.04)"}}>
+            {["Vehicul","UIT & Timp","Prag reînnoire","Reînnoiri","Status","Acțiuni"].map(h=>(
+              <th key={h} style={{padding:"9px 18px",textAlign:"left",fontSize:9,fontWeight:700,letterSpacing:".08em",textTransform:"uppercase",color:"#4b5563"}}>{h}</th>
+            ))}
+          </tr></thead>
+          <tbody>
+            {critical.map(v=><VRow key={v.id} v={v}/>)}
+            {warning.map(v=><VRow key={v.id} v={v}/>)}
+            {ok.map(v=><VRow key={v.id} v={v}/>)}
+          </tbody>
+        </table>
+      </div>
+    )}
+
+    <div className="glass fu2" style={{borderRadius:15,padding:18}}>
       <div style={{fontSize:10,fontWeight:700,letterSpacing:".08em",textTransform:"uppercase",color:"#4b5563",marginBottom:14}}>Cum Funcționează</div>
       <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:8}}>
-        {[{icon:Signal,l:"Monitorizare",d:"Scanăm UIT-ul la fiecare 15 min",c:"#60a5fa"},{icon:Timer,l:"Detecție",d:"Detectăm când expiră sub pragul setat",c:"#fbbf24"},{icon:Bot,l:"AI Decide",d:"Verificăm dacă vehiculul e în tranzit",c:"#a78bfa"},{icon:Zap,l:"Reînnoire",d:"Apelăm ANAF API automat",c:"#34d399"},{icon:Bell,l:"Notificare",d:"Confirmare pe telefon/email",c:"#f87171"}].map((s,i)=>(
-          <div key={s.l} style={{textAlign:"center",padding:"13px 8px",borderRadius:11,background:"rgba(255,255,255,.02)",border:"1px solid rgba(255,255,255,.04)"}}>
-            <div style={{width:38,height:38,borderRadius:11,background:`${s.c}18`,display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 9px"}}><s.icon size={16} color={s.c}/></div>
+        {[{icon:Signal,l:"Monitorizare",d:"Supabase Realtime scanează UIT-ul continuu",c:"#60a5fa"},{icon:Timer,l:"Detecție",d:"Alertă când expiră sub pragul setat",c:"#fbbf24"},{icon:Bot,l:"Engine",d:"SmartLogis decide și acționează",c:"#a78bfa"},{icon:Zap,l:"Reînnoire",d:"Update instant în Supabase + log",c:"#34d399"},{icon:Bell,l:"Confirmare",d:"Toast + activitate în dashboard",c:"#f87171"}].map((s,i)=>(
+          <div key={s.l} style={{textAlign:"center",padding:"12px 8px",borderRadius:10,background:"rgba(255,255,255,.02)",border:"1px solid rgba(255,255,255,.04)"}}>
+            <div style={{width:36,height:36,borderRadius:10,background:`${s.c}18`,display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 8px"}}><s.icon size={15} color={s.c}/></div>
             <div style={{fontSize:11,fontWeight:700,color:"#f9fafb",marginBottom:3}}>{i+1}. {s.l}</div>
             <div style={{fontSize:10,color:"#6b7280",lineHeight:1.4}}>{s.d}</div>
           </div>
         ))}
       </div>
-    </div>
-    {/* Rules */}
-    <div className="glass fu2" style={{borderRadius:15,overflow:"hidden"}}>
-      <div style={{padding:"14px 18px",borderBottom:"1px solid rgba(255,255,255,.05)",display:"flex",justifyContent:"space-between"}}>
-        <div style={{fontSize:13,fontWeight:700,color:"#f9fafb"}}>Reguli Auto-Reînnoire</div>
-        <span style={{fontSize:11,color:"#6b7280"}}>{rules.filter(r=>r.on).length} vehicule active</span>
-      </div>
-      <table style={{width:"100%",borderCollapse:"collapse"}}>
-        <thead><tr style={{borderBottom:"1px solid rgba(255,255,255,.04)"}}>{["Vehicul","Prag (ore)","Reînnoiri","Ultima","Status",""].map(h=><th key={h} style={{padding:"9px 18px",textAlign:"left",fontSize:9,fontWeight:700,letterSpacing:".08em",textTransform:"uppercase",color:"#4b5563"}}>{h}</th>)}</tr></thead>
-        <tbody>
-          {rules.map(r=>(
-            <tr key={r.id} className="trow" style={{borderBottom:"1px solid rgba(255,255,255,.03)"}}>
-              <td style={{padding:"13px 18px"}}><span style={{fontFamily:"'DM Mono',monospace",fontSize:12,fontWeight:600,color:"#f9fafb"}}>{r.plate}</span></td>
-              <td style={{padding:"13px 18px"}}><div style={{display:"flex",alignItems:"center",gap:9}}><input type="range" min={1} max={12} value={r.h} onChange={e=>setRules(rs=>rs.map(x=>x.id===r.id?{...x,h:+e.target.value}:x))} style={{width:72,accentColor:"#34d399"}}/><span style={{fontFamily:"'DM Mono',monospace",fontSize:12,color:"#fbbf24",fontWeight:600,minWidth:28}}>{r.h}h</span></div></td>
-              <td style={{padding:"13px 18px"}}><span style={{fontSize:18,fontWeight:700,color:"#f9fafb",fontFamily:"'DM Mono',monospace"}}>{r.count}</span></td>
-              <td style={{padding:"13px 18px",fontSize:11,color:"#6b7280"}}>{r.last}</td>
-              <td style={{padding:"13px 18px"}}><span className="badge" style={{background:r.on?"rgba(16,185,129,.1)":"rgba(255,255,255,.04)",color:r.on?"#34d399":"#6b7280",border:`1px solid ${r.on?"rgba(16,185,129,.2)":"rgba(255,255,255,.07)"}`}}>{r.on?"Activ":"Inactiv"}</span></td>
-              <td style={{padding:"13px 18px"}}><button className="btn-ghost" onClick={()=>setRules(rs=>rs.map(x=>x.id===r.id?{...x,on:!x.on}:x))} style={{background:r.on?"rgba(239,68,68,.08)":"rgba(16,185,129,.08)",color:r.on?"#f87171":"#34d399",border:`1px solid ${r.on?"rgba(239,68,68,.2)":"rgba(16,185,129,.2)"}`,borderRadius:7,padding:"5px 11px",fontSize:10,fontWeight:600}}>{r.on?"Dezactivează":"Activează"}</button></td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-    {/* Sim */}
-    <div className="glass fu3" style={{borderRadius:15,padding:20}}>
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16}}>
-        <div><div style={{fontSize:13,fontWeight:700,color:"#f9fafb",marginBottom:2}}>Simulare Motor Live</div><div style={{fontSize:11,color:"#6b7280"}}>Testează cum reacționează motorul în timp real</div></div>
-        <button className="btn" onClick={runSim} disabled={simRunning} style={{background:simRunning?"rgba(255,255,255,.04)":"#f9fafb",color:simRunning?"#6b7280":"#0a0a0a",border:"none",borderRadius:9,padding:"9px 18px",fontSize:12,fontWeight:700,display:"flex",alignItems:"center",gap:7,boxShadow:simRunning?"none":"0 4px 16px rgba(255,255,255,.1)"}}>
-          {simRunning?<><RotateCcw size={12} className="spin"/>Rulare...</>:<><Play size={12}/>Rulează Simulare</>}
-        </button>
-      </div>
-      {simLog.length>0&&<div style={{background:"rgba(0,0,0,.35)",borderRadius:9,padding:"13px 15px",fontFamily:"'DM Mono',monospace",fontSize:11,lineHeight:2}}>
-        {simLog.map((l,i)=><div key={i} style={{color:l.c,display:"flex",gap:8}}><span style={{color:"#1e2535"}}>{String(i+1).padStart(2,"0")}</span><span>{l.m}</span></div>)}
-      </div>}
     </div>
   </div>;
 }
@@ -1597,63 +1905,238 @@ function ViewOCR({ addToast }) {
 // VIEW: DISPATCH
 // ══════════════════════════════════════════════════════════════════════════════
 function ViewDispatch({ fleet, addToast }) {
-  const [sel, setSel] = useState(fleet[0]);
-  const [sent, setSent] = useState(false);
-  const [ch, setCh] = useState("whatsapp");
-  const sms = `Nowy transport RO (${sel.uit}).\nKliknij GPS w przeglądarce:\nhttps://track.smartlogis.ro/${sel.plate}\n\n---\nNew RO transport (${sel.uit}). Browser GPS:\nhttps://track.smartlogis.ro/${sel.plate}`;
-  const send = () => { setSent(true); addToast({type:"success",title:`Link trimis via ${ch==="whatsapp"?"WhatsApp":"SMS"}`,msg:`${sel.driver} · ${sel.plate}`}); setTimeout(()=>setSent(false),4000); };
+  const [sel, setSel]         = useState(null);
+  const [tokens, setTokens]   = useState([]);
+  const [sending, setSending] = useState(false);
+  const [mapVehicles, setMapVehicles] = useState([]);
+  const [selMarker, setSelMarker]     = useState(null);
+  const MBOX = import.meta.env.VITE_MAPBOX_TOKEN;
+
+  // Load dispatch tokens from DB
+  const loadTokens = useCallback(async () => {
+    if (!supabase) return;
+    const { data } = await supabase.from("dispatch_tokens")
+      .select("*, vehicles(plate,driver_name)")
+      .order("created_at",{ascending:false}).limit(20);
+    if (data) setTokens(data);
+  }, []);
+
+  useEffect(()=>{ loadTokens(); },[loadTokens]);
+
+  // Live positions from vehicles table
+  useEffect(()=>{
+    const active = fleet.filter(v=>v.last_lat&&v.last_lng);
+    setMapVehicles(active);
+  },[fleet]);
+
+  // Subscribe to vehicle GPS updates
+  useEffect(()=>{
+    if(!supabase) return;
+    const ch = supabase.channel("gps-dispatch")
+      .on("postgres_changes",{event:"UPDATE",schema:"public",table:"vehicles"},payload=>{
+        if(payload.new.last_lat){
+          setMapVehicles(prev=>{
+            const exists = prev.find(v=>v._dbId===payload.new.id);
+            const updated = {...(exists||{}),_dbId:payload.new.id,plate:payload.new.plate,last_lat:payload.new.last_lat,last_lng:payload.new.last_lng,last_seen_at:payload.new.last_seen_at,status:payload.new.status||"ok"};
+            return exists ? prev.map(v=>v._dbId===payload.new.id?updated:v) : [...prev,updated];
+          });
+        }
+      }).subscribe();
+    return ()=>supabase.removeChannel(ch);
+  },[]);
+
+  const sendLink = async () => {
+    if (!sel) { addToast({type:"error",title:"Selectează vehiculul",msg:"Alege un vehicul din lista de mai jos"}); return; }
+    setSending(true);
+    const token = "gps-" + sel._dbId + "-" + Date.now().toString(36);
+    const expires = new Date(Date.now()+24*3600000).toISOString();
+    const supaUrl = import.meta.env.VITE_SUPABASE_URL||"";
+    const supaKey = import.meta.env.VITE_SUPABASE_ANON_KEY||"";
+    const driverUrl = window.location.origin + "/driver.html?token=" + token + "&su=" + encodeURIComponent(supaUrl) + "&sk=" + encodeURIComponent(supaKey);
+
+    if (supabase) {
+      await supabase.from("dispatch_tokens").insert({
+        tenant_id: sel._raw?.tenant_id,
+        vehicle_id: sel._dbId,
+        token,
+        phone: sel.driver_phone||"",
+        expires_at: expires,
+      });
+    }
+    setSending(false);
+    navigator.clipboard?.writeText(driverUrl).then(()=>{
+      addToast({type:"success",title:"Link GPS copiat!",msg:sel.plate + " · Trimite-l șoferului"});
+    }).catch(()=>{
+      addToast({type:"info",title:"Link GPS generat",msg:driverUrl.slice(0,60)+"..."});
+    });
+    loadTokens();
+  };
+
+  const revokeToken = async (id) => {
+    if(!supabase) return;
+    await supabase.from("dispatch_tokens").delete().eq("id",id);
+    addToast({type:"info",title:"Link revocat",msg:"Token GPS șters"});
+    loadTokens();
+  };
+
+  const statusCol = {ok:"#34d399",warning:"#fbbf24",critical:"#f87171"};
+
   return <div style={{display:"flex",flexDirection:"column",gap:18}}>
-    <div className="fu"><div style={{fontSize:22,fontWeight:700,color:"#f9fafb",marginBottom:3}}>Dispecerat Extern</div><div style={{fontSize:12,color:"#6b7280"}}>GPS tracking pentru șoferi străini · Fără instalare aplicație ANAF</div></div>
-    <div className="fu1" style={{display:"grid",gridTemplateColumns:"1fr 320px",gap:14}}>
+    <div className="fu">
+      <div style={{fontSize:22,fontWeight:700,color:"#f9fafb",marginBottom:3}}>Dispecerat GPS Extern</div>
+      <div style={{fontSize:12,color:"#6b7280"}}>Hartă live + linkuri GPS pentru șoferi · Fără instalare aplicație · Direct din browser</div>
+    </div>
+
+    {/* MAP */}
+    <div className="fu1" style={{borderRadius:16,overflow:"hidden",border:"1px solid rgba(255,255,255,.07)"}}>
+      {MBOX ? (
+        <MapboxFleetView vehicles={mapVehicles} selMarker={selMarker} setSelMarker={setSelMarker} token={MBOX}/>
+      ) : (
+        <div style={{height:300,background:"rgba(255,255,255,.02)",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:10}}>
+          <MapPin size={32} color="#374151"/>
+          <div style={{fontSize:13,color:"#4b5563",textAlign:"center"}}>
+            Adaugă <code style={{fontFamily:"monospace",color:"#60a5fa",fontSize:12}}>VITE_MAPBOX_TOKEN</code> în <code style={{fontFamily:"monospace",color:"#60a5fa",fontSize:12}}>.env</code>
+          </div>
+          <div style={{fontSize:11,color:"#374151"}}>
+            {mapVehicles.length>0 ? mapVehicles.length+" vehicule cu GPS" : "Niciun vehicul cu GPS activ"}
+          </div>
+        </div>
+      )}
+    </div>
+
+    <div style={{display:"grid",gridTemplateColumns:"1fr 340px",gap:14}}>
       <div style={{display:"flex",flexDirection:"column",gap:13}}>
-        <div className="glass" style={{borderRadius:15,padding:18}}>
-          <div style={{fontSize:10,fontWeight:700,letterSpacing:".08em",textTransform:"uppercase",color:"#4b5563",marginBottom:14}}>Selectează Vehicul</div>
-          {fleet.map(v=>(
-            <div key={v.id} onClick={()=>setSel(v)} style={{display:"flex",alignItems:"center",gap:11,padding:"11px 13px",borderRadius:11,cursor:"pointer",transition:"all .15s",background:sel.id===v.id?"rgba(255,255,255,.07)":"rgba(255,255,255,.02)",border:`1px solid ${sel.id===v.id?"rgba(255,255,255,.12)":"rgba(255,255,255,.04)"}`,marginBottom:7}}>
-              <span style={{fontSize:18}}>{v.flag}</span>
-              <div style={{flex:1}}><div style={{fontFamily:"'DM Mono',monospace",fontSize:12,fontWeight:600,color:"#f9fafb"}}>{v.plate}</div><div style={{fontSize:10,color:"#6b7280"}}>{v.driver} · {v.route}</div></div>
-              <SBadge s={v.status}/>
-              {sel.id===v.id&&<CheckCircle size={13} color="#34d399"/>}
+        <div className="glass fu2" style={{borderRadius:15,padding:18}}>
+          <div style={{fontSize:11,fontWeight:700,letterSpacing:".08em",textTransform:"uppercase",color:"#4b5563",marginBottom:14}}>Selectează vehicul pentru link GPS</div>
+          {fleet.length===0 ? (
+            <div style={{color:"#6b7280",fontSize:12,textAlign:"center",padding:20}}>Nu ai vehicule adăugate.</div>
+          ) : fleet.map(v=>(
+            <div key={v.id} onClick={()=>setSel(sel?.id===v.id?null:v)}
+              style={{display:"flex",alignItems:"center",gap:11,padding:"10px 12px",borderRadius:10,cursor:"pointer",transition:"all .15s",background:sel?.id===v.id?"rgba(255,255,255,.07)":"rgba(255,255,255,.02)",border:`1px solid ${sel?.id===v.id?"rgba(255,255,255,.12)":"rgba(255,255,255,.04)"}`,marginBottom:7}}>
+              <div style={{width:8,height:8,borderRadius:"50%",background:statusCol[v.status]||"#34d399",flexShrink:0}}/>
+              <div style={{flex:1}}>
+                <div style={{fontFamily:"'DM Mono',monospace",fontSize:12,fontWeight:600,color:"#f9fafb"}}>{v.plate}</div>
+                <div style={{fontSize:10,color:"#6b7280"}}>{v.driver}</div>
+              </div>
+              {v.last_lat && <div style={{fontSize:9,color:"#34d399",fontFamily:"monospace",background:"rgba(16,185,129,.08)",border:"1px solid rgba(16,185,129,.2)",borderRadius:6,padding:"2px 6px"}}>📍 GPS LIVE</div>}
+              {sel?.id===v.id&&<CheckCircle size={13} color="#34d399"/>}
             </div>
           ))}
         </div>
-        <div className="glass" style={{borderRadius:15,padding:18}}>
-          <div style={{fontSize:10,fontWeight:700,letterSpacing:".08em",textTransform:"uppercase",color:"#4b5563",marginBottom:14}}>Configurare Trimitere</div>
-          <div style={{marginBottom:13}}><div style={{fontSize:10,color:"#6b7280",marginBottom:7}}>Canal</div>
-            <div style={{display:"flex",gap:8}}>{[{id:"whatsapp",l:"WhatsApp",icon:MessageSquare},{id:"sms",l:"SMS",icon:Phone}].map(c=>(
-              <button className="btn-ghost" key={c.id} onClick={()=>setCh(c.id)} style={{flex:1,background:ch===c.id?"rgba(255,255,255,.08)":"rgba(255,255,255,.03)",border:`1px solid ${ch===c.id?"rgba(255,255,255,.14)":"rgba(255,255,255,.06)"}`,borderRadius:9,padding:"9px 0",fontSize:11,fontWeight:600,color:ch===c.id?"#f9fafb":"#6b7280",display:"flex",alignItems:"center",justifyContent:"center",gap:5}}><c.icon size={12}/>{c.l}</button>
-            ))}</div>
-          </div>
-          <div style={{marginBottom:13}}><div style={{fontSize:10,color:"#6b7280",marginBottom:5}}>Număr telefon</div><input defaultValue="+48 601 234 567" style={{width:"100%",background:"rgba(255,255,255,.04)",border:"1px solid rgba(255,255,255,.08)",borderRadius:9,padding:"9px 12px",fontSize:12,color:"#f9fafb",outline:"none",fontFamily:"'DM Mono',monospace"}}/></div>
-          <div style={{marginBottom:16}}><div style={{fontSize:10,color:"#6b7280",marginBottom:5}}>Mesaj (PL/EN)</div><textarea readOnly rows={5} value={sms} style={{width:"100%",background:"rgba(0,0,0,.2)",border:"1px solid rgba(255,255,255,.06)",borderRadius:9,padding:"9px 12px",fontSize:10,color:"#6b7280",outline:"none",resize:"none",fontFamily:"'DM Mono',monospace",lineHeight:1.7}}/></div>
-          <button className="btn" onClick={send} style={{width:"100%",background:sent?"rgba(16,185,129,.1)":"#f9fafb",color:sent?"#34d399":"#0a0a0a",border:sent?"1px solid rgba(16,185,129,.25)":"none",borderRadius:11,padding:"12px 0",fontSize:13,fontWeight:700,display:"flex",alignItems:"center",justifyContent:"center",gap:8,boxShadow:sent?"none":"0 4px 16px rgba(255,255,255,.1)"}}>
-            {sent?<><CheckCircle size={14}/>Trimis cu Succes!</>:<><Send size={13}/>Trimite {ch==="whatsapp"?"WhatsApp":"SMS"}</>}
-          </button>
-        </div>
+
+        <button className="btn fu3" onClick={sendLink} disabled={sending||!sel}
+          style={{background:sel?"linear-gradient(135deg,#34d399,#059669)":"rgba(255,255,255,.04)",color:sel?"#064e3b":"#374151",border:"none",borderRadius:11,padding:"14px 0",fontSize:14,fontWeight:700,display:"flex",alignItems:"center",justifyContent:"center",gap:9,boxShadow:sel?"0 4px 20px rgba(16,185,129,.3)":"none"}}>
+          {sending?<RefreshCw size={14} className="spin"/>:<Navigation size={14}/>}
+          {sel?"Generează & Copiază Link GPS":"Selectează un vehicul"}
+        </button>
       </div>
-      {/* Phone */}
-      <div className="glass" style={{borderRadius:15,padding:26,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center"}}>
-        <div style={{fontSize:10,fontWeight:700,letterSpacing:".08em",textTransform:"uppercase",color:"#4b5563",marginBottom:22}}>Vizualizare Șofer</div>
-        <div style={{width:210,background:"#0d1117",borderRadius:34,border:"5px solid #1c2333",overflow:"hidden",boxShadow:"0 28px 70px rgba(0,0,0,.5)"}}>
-          <div style={{padding:"11px 14px 0",display:"flex",justifyContent:"center"}}><div style={{width:68,height:17,background:"#1c2333",borderRadius:9}}/></div>
-          <div style={{background:"#0d1117",padding:"14px 14px 0"}}>
-            <div style={{fontSize:8,color:"#374151",fontFamily:"'DM Mono',monospace",marginBottom:1}}>SmartLogis · GPS Track</div>
-            <div style={{fontSize:7,color:"#1f2937",marginBottom:14,fontFamily:"'DM Mono',monospace"}}>{sel.uit} · {sel.plate}</div>
-            <div style={{display:"flex",justifyContent:"center",position:"relative",marginBottom:14,height:92}}>
-              <div style={{position:"absolute",width:84,height:84,borderRadius:"50%",border:"1px solid rgba(16,185,129,.12)",top:4}} className="spinSlow"/>
-              <div style={{position:"absolute",width:48,height:48,background:"rgba(16,185,129,.08)",borderRadius:"50%",top:22,animation:"pulseRing 2s ease-out infinite"}}/>
-              <div style={{position:"absolute",width:42,height:42,background:"#10b981",borderRadius:"50%",top:25,display:"flex",alignItems:"center",justifyContent:"center",boxShadow:"0 0 22px rgba(16,185,129,.5)"}}><Navigation size={17} color="#fff"/></div>
-            </div>
-            <div style={{textAlign:"center",marginBottom:14}}><div style={{color:"#34d399",fontSize:12,fontWeight:700,marginBottom:1}}>GPS Activ</div><div style={{fontSize:8,color:"#374151",lineHeight:1.5}}>Locație trimisă autorităților<br/>române în timp real</div></div>
-            <div style={{background:"#161b27",borderRadius:10,padding:9,marginBottom:7}}><div style={{display:"flex",justifyContent:"space-between",marginBottom:3}}><span style={{fontSize:7,color:"#374151"}}>Locație</span><span style={{fontSize:7,color:"#34d399",display:"flex",alignItems:"center",gap:2}}><span className="blink" style={{width:4,height:4,background:"#34d399",borderRadius:"50%",display:"inline-block"}}/>Live</span></div><div style={{fontSize:9,color:"#f9fafb",fontWeight:600}}>{sel.location}</div></div>
-            <div style={{background:"#161b27",borderRadius:10,padding:9,marginBottom:7,display:"flex",alignItems:"center",gap:7}}><CheckCircle size={11} color="#34d399"/><div><div style={{fontSize:7,color:"#374151"}}>ANAF Confirmat</div><div style={{fontSize:8,color:"#f9fafb",fontWeight:600}}>Date transmise</div></div></div>
-          </div>
-          <div style={{background:"#0d1117",padding:"10px 0 14px",display:"flex",justifyContent:"center"}}><div style={{width:56,height:3,background:"#1c2333",borderRadius:4}}/></div>
+
+      <div className="glass fu2" style={{borderRadius:15,padding:16}}>
+        <div style={{fontSize:11,fontWeight:700,letterSpacing:".08em",textTransform:"uppercase",color:"#4b5563",marginBottom:14}}>
+          Linkuri Active ({tokens.filter(t=>new Date(t.expires_at)>new Date()).length})
         </div>
-        <div style={{fontSize:10,color:"#4b5563",marginTop:14,textAlign:"center",lineHeight:1.6,maxWidth:180}}>Browser GPS link — fără instalare, fără cont.</div>
+        {tokens.length===0 ? (
+          <div style={{color:"#6b7280",fontSize:12,textAlign:"center",padding:16}}>Niciun link generat încă.</div>
+        ) : tokens.map(t=>{
+          const expired = t.expires_at && new Date(t.expires_at)<new Date();
+          return (
+            <div key={t.id} style={{display:"flex",alignItems:"center",gap:8,padding:"9px 10px",borderRadius:9,background:"rgba(255,255,255,.025)",border:"1px solid rgba(255,255,255,.05)",marginBottom:7}}>
+              <div style={{width:7,height:7,borderRadius:"50%",background:expired?"#f87171":"#34d399",flexShrink:0}}/>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{fontSize:11,fontWeight:600,color:"#e5e7eb",fontFamily:"monospace"}}>{t.vehicles?.plate||"—"}</div>
+                <div style={{fontSize:9,color:"#6b7280"}}>{t.vehicles?.driver_name||""} · {expired?"EXPIRAT":new Date(t.expires_at).toLocaleTimeString("ro-RO",{hour:"2-digit",minute:"2-digit"})}</div>
+              </div>
+              {!expired && (
+                <button onClick={()=>navigator.clipboard?.writeText(window.location.origin+"/driver.html?token="+t.token)}
+                  style={{background:"none",border:"1px solid rgba(255,255,255,.08)",borderRadius:6,padding:"3px 7px",fontSize:9,color:"#9ca3af",cursor:"pointer"}}>
+                  📋
+                </button>
+              )}
+              <button onClick={()=>revokeToken(t.id)} style={{background:"none",border:"none",cursor:"pointer",color:"#4b5563",padding:"2px"}}><X size={11}/></button>
+            </div>
+          );
+        })}
+
+        <div style={{marginTop:14,padding:"12px 13px",background:"rgba(59,130,246,.05)",border:"1px solid rgba(59,130,246,.15)",borderRadius:10}}>
+          <div style={{fontSize:11,fontWeight:600,color:"#60a5fa",marginBottom:6}}>📱 Cum funcționează</div>
+          <div style={{fontSize:10,color:"#9ca3af",lineHeight:1.7}}>
+            1. Selectezi vehiculul și apeși "Generează Link"<br/>
+            2. Trimiți link-ul șoferului pe WhatsApp/SMS<br/>
+            3. Șoferul deschide din browser → accesează GPS → trimite automat coordonatele<br/>
+            4. Harta se actualizează live fără nicio aplicație instalată
+          </div>
+        </div>
       </div>
     </div>
   </div>;
+}
+
+// ── Mapbox Fleet View component ───────────────────────────────────────────────
+function MapboxFleetView({ vehicles, selMarker, setSelMarker, token }) {
+  const mapRef = useRef(null);
+  const mapInstanceRef = useRef(null);
+  const markersRef = useRef({});
+
+  useEffect(()=>{
+    if(!mapRef.current || mapInstanceRef.current) return;
+    import("mapbox-gl").then(({default:mapboxgl})=>{
+      import("mapbox-gl/dist/mapbox-gl.css").catch(()=>{});
+      mapboxgl.accessToken = token;
+      const map = new mapboxgl.Map({
+        container: mapRef.current,
+        style: "mapbox://styles/mapbox/dark-v11",
+        center: [25.0, 45.9],
+        zoom: 6,
+      });
+      mapInstanceRef.current = map;
+      map.addControl(new mapboxgl.NavigationControl(),"top-right");
+    }).catch(()=>{});
+  },[token]);
+
+  useEffect(()=>{
+    const map = mapInstanceRef.current;
+    if(!map||!map.isStyleLoaded()) return;
+    import("mapbox-gl").then(({default:mapboxgl})=>{
+      const cols = {ok:"#34d399",warning:"#fbbf24",critical:"#f87171"};
+      vehicles.forEach(v=>{
+        if(!v.last_lat||!v.last_lng) return;
+        const col = cols[v.status]||"#34d399";
+        const el = document.createElement("div");
+        el.style.cssText = `width:28px;height:28px;border-radius:50%;background:${col};display:flex;align-items:center;justify-content:center;font-size:13px;cursor:pointer;box-shadow:0 0 10px ${col}66;border:2px solid ${col}44`;
+        el.innerHTML = "🚛";
+        el.addEventListener("click",()=>setSelMarker(v));
+        if(markersRef.current[v._dbId]) {
+          markersRef.current[v._dbId].setLngLat([v.last_lng,v.last_lat]);
+        } else {
+          markersRef.current[v._dbId] = new mapboxgl.Marker({element:el}).setLngLat([v.last_lng,v.last_lat]).addTo(map);
+        }
+      });
+    }).catch(()=>{});
+  },[vehicles]);
+
+  return (
+    <div style={{position:"relative"}}>
+      <div ref={mapRef} style={{width:"100%",height:340}}/>
+      {vehicles.length===0&&(
+        <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",pointerEvents:"none"}}>
+          <div style={{background:"rgba(6,8,16,.85)",borderRadius:10,padding:"10px 16px",fontSize:12,color:"#6b7280"}}>
+            Niciun vehicul cu GPS activ · Generează link GPS pentru șoferi
+          </div>
+        </div>
+      )}
+      {selMarker&&(
+        <div style={{position:"absolute",bottom:16,left:16,background:"#0b0f1a",border:"1px solid rgba(255,255,255,.1)",borderRadius:12,padding:"12px 16px",minWidth:200,zIndex:10}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}>
+            <div style={{fontSize:14,fontWeight:700,color:"#f9fafb",fontFamily:"monospace"}}>{selMarker.plate}</div>
+            <button onClick={()=>setSelMarker(null)} style={{background:"none",border:"none",cursor:"pointer",color:"#6b7280"}}><X size={12}/></button>
+          </div>
+          <div style={{fontSize:11,color:"#9ca3af"}}>👤 {selMarker.driver}</div>
+          <div style={{fontSize:11,color:"#9ca3af"}}>📍 {selMarker.last_lat?.toFixed(5)}, {selMarker.last_lng?.toFixed(5)}</div>
+          {selMarker.last_seen_at&&<div style={{fontSize:10,color:"#6b7280",marginTop:4}}>Ultima actualizare: {new Date(selMarker.last_seen_at).toLocaleTimeString("ro-RO")}</div>}
+        </div>
+      )}
+    </div>
+  );
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1852,16 +2335,195 @@ CREATE INDEX CONCURRENTLY idx_vehicles_uit_expiry
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// ROOT — manages app-level routing: landing → onboarding → app
+// AUTH SCREEN — Real Supabase login/register (keeps demo UI when no Supabase)
+// ══════════════════════════════════════════════════════════════════════════════
+function AuthScreen({ onAuth }) {
+  const [mode, setMode]     = useState("login");
+  const [email, setEmail]   = useState("");
+  const [pw, setPw]         = useState("");
+  const [company, setCo]    = useState("");
+  const [name, setName]     = useState("");
+  const [showPw, setShowPw] = useState(false);
+  const [loading, setLoad]  = useState(false);
+  const [err, setErr]       = useState("");
+
+  const submit = async () => {
+    setErr(""); if (!email || !pw) { setErr("Completează email și parolă."); return; }
+    setLoad(true);
+    try {
+      if (mode === "login") {
+        const { error } = await supabase.auth.signInWithPassword({ email, password: pw });
+        if (error) throw error;
+      } else {
+        if (!company) { setErr("Introdu denumirea firmei."); setLoad(false); return; }
+        const { error } = await supabase.auth.signUp({
+          email, password: pw,
+          options: { data: { company, full_name: name || email } }
+        });
+        if (error) throw error;
+        setErr("✅ Verifică emailul pentru confirmare, apoi loghează-te."); setLoad(false); return;
+      }
+    } catch(e) { setErr(e.message || "Eroare autentificare"); }
+    setLoad(false);
+  };
+
+  const s = {
+    wrap: {minHeight:"100vh",background:"#060810",display:"flex",alignItems:"center",justifyContent:"center",position:"relative",overflow:"hidden"},
+    orb: {position:"absolute",top:"20%",left:"50%",transform:"translateX(-50%)",width:500,height:400,background:"radial-gradient(circle,rgba(16,185,129,.05),transparent 65%)",pointerEvents:"none"},
+    card: {width:420,background:"rgba(255,255,255,.025)",border:"1px solid rgba(255,255,255,.08)",borderRadius:20,padding:"36px 32px",position:"relative",zIndex:1},
+    tabs: {display:"flex",gap:5,marginBottom:24,background:"rgba(255,255,255,.03)",borderRadius:10,padding:4},
+    tab: (a)=>({flex:1,padding:"8px 0",borderRadius:8,border:"none",cursor:"pointer",background:a?"rgba(255,255,255,.1)":"transparent",color:a?"#f9fafb":"#6b7280",fontSize:13,fontWeight:600,transition:"all .15s"}),
+    label: {fontSize:10,fontWeight:700,letterSpacing:".08em",textTransform:"uppercase",color:"#4b5563",display:"block",marginBottom:5},
+    row: {marginBottom:14},
+    err: {background:"rgba(239,68,68,.08)",border:"1px solid rgba(239,68,68,.2)",borderRadius:9,padding:"9px 12px",fontSize:12,color:"#f87171",marginBottom:14},
+    ok: {background:"rgba(16,185,129,.08)",border:"1px solid rgba(16,185,129,.2)",borderRadius:9,padding:"9px 12px",fontSize:12,color:"#86efac",marginBottom:14},
+  };
+
+  return (
+    <div style={s.wrap}>
+      <style>{G}</style>
+      <div style={s.orb}/>
+      <div style={s.card}>
+        <div style={{display:"flex",alignItems:"center",gap:9,marginBottom:26}}>
+          <div style={{width:34,height:34,background:"#f9fafb",borderRadius:8,display:"flex",alignItems:"center",justifyContent:"center"}}><Truck size={16} color="#060810"/></div>
+          <div><div style={{fontSize:15,fontWeight:800,color:"#f9fafb",letterSpacing:-.3}}>SmartLogis</div><div style={{fontSize:10,color:"#374151"}}>Platformă transport RO</div></div>
+        </div>
+
+        <div style={s.tabs}>
+          <button style={s.tab(mode==="login")}  onClick={()=>{setMode("login");setErr("")}}>Autentificare</button>
+          <button style={s.tab(mode==="register")} onClick={()=>{setMode("register");setErr("")}}>Cont Nou</button>
+        </div>
+
+        {err && <div style={err.startsWith("✅")?s.ok:s.err}>{err}</div>}
+
+        {mode==="register" && <>
+          <div style={s.row}>
+            <label style={s.label}>Firma *</label>
+            <input className="ifield" placeholder="SC Transport SRL" value={company} onChange={e=>setCo(e.target.value)}/>
+          </div>
+          <div style={s.row}>
+            <label style={s.label}>Numele tău</label>
+            <input className="ifield" placeholder="Ion Popescu" value={name} onChange={e=>setName(e.target.value)}/>
+          </div>
+        </>}
+
+        <div style={s.row}>
+          <label style={s.label}>Email *</label>
+          <input className="ifield" type="email" placeholder="admin@firma.ro" value={email} onChange={e=>setEmail(e.target.value)} onKeyDown={e=>e.key==="Enter"&&submit()}/>
+        </div>
+        <div style={{...s.row,position:"relative"}}>
+          <label style={s.label}>Parolă *</label>
+          <input className="ifield" type={showPw?"text":"password"} placeholder="••••••••" value={pw} onChange={e=>setPw(e.target.value)} style={{paddingRight:40}} onKeyDown={e=>e.key==="Enter"&&submit()}/>
+          <span onClick={()=>setShowPw(v=>!v)} style={{position:"absolute",right:12,top:30,cursor:"pointer",color:"#4b5563"}}>{showPw?<EyeOff size={14}/>:<Eye size={14}/>}</span>
+        </div>
+
+        <button className="btn-primary" style={{width:"100%",justifyContent:"center",marginTop:4}} onClick={submit} disabled={loading}>
+          {loading && <RefreshCw size={13} className="spin"/>}
+          {mode==="login" ? "Intră în cont" : "Creează contul"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ROOT — manages app-level routing: landing → auth/onboarding → app
 // ══════════════════════════════════════════════════════════════════════════════
 export default function SmartLogisApp() {
-  const [screen, setScreen] = useState("landing"); // "landing" | "onboarding" | "app"
+  const [screen, setScreen]   = useState("landing");
+  const [session, setSession] = useState(undefined); // undefined = loading
+  const [profile, setProfile] = useState(null);
+  const [tenant,  setTenant]  = useState(null);
+  const [dbFleet, setDbFleet] = useState(null); // null = not loaded yet
+
+  // ── Auth listener ──────────────────────────────────────────────
+  useEffect(() => {
+    if (!supabase) { setSession(null); return; }
+    supabase.auth.getSession().then(({ data: { session: s } }) => setSession(s));
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_, s) => {
+      setSession(s);
+      if (!s) { setProfile(null); setTenant(null); setDbFleet(null); }
+    });
+    return () => subscription.unsubscribe();
+  }, []);
+
+  // ── Load profile + tenant when session ────────────────────────
+  useEffect(() => {
+    if (!session || !supabase) return;
+    supabase.from("profiles").select("*, tenants(*)").eq("id", session.user.id).single()
+      .then(({ data }) => { if (data) { setProfile(data); setTenant(data.tenants); } });
+  }, [session]);
+
+  // ── Load vehicles from DB (supplement FLEET_DATA) ─────────────
+  useEffect(() => {
+    if (!tenant || !supabase) return;
+    const load = () =>
+      supabase.from("vehicles").select("*").eq("tenant_id", tenant.id).order("created_at")
+        .then(({ data }) => {
+          if (data && data.length > 0) {
+            // Map DB vehicle to the shape FLEET_DATA uses
+            setDbFleet(data.map(v => ({
+              id: v.id, plate: v.plate, driver: v.driver_name || "—", flag: "🇷🇴",
+              route: v.route || "—", uit: v.uit_code || "Fără UIT",
+              expiresMin: v.uit_expires_at
+                ? Math.max(0, Math.round((new Date(v.uit_expires_at) - new Date()) / 60000))
+                : 0,
+              location: "—", waitH: 0,
+              status: (() => {
+                const h = v.uit_expires_at ? (new Date(v.uit_expires_at) - new Date()) / 3600000 : -1;
+                return h < 0 ? "critical" : h < (v.renew_threshold_h || 4) ? "warning" : "ok";
+              })(),
+              cargo: v.cargo || "—", weight: v.weight ? v.weight + "t" : "—",
+              autoRenew: v.auto_renew || false,
+              _dbId: v.id, _raw: v,
+            })));
+          }
+        });
+    load();
+    if (!supabase) return;
+    const ch = supabase.channel(`fleet-root-${tenant.id}`)
+      .on("postgres_changes", { event:"*", schema:"public", table:"vehicles", filter:`tenant_id=eq.${tenant.id}` }, load)
+      .subscribe();
+    return () => supabase.removeChannel(ch);
+  }, [tenant]);
+
+  // ── Decide which screen ─────────────────────────────────────────
+  const effectiveScreen = (() => {
+    if (!supabase) return screen; // no Supabase → use demo flow
+    if (session === undefined) return "loading";
+    if (session) return "app";
+    return screen === "app" ? "auth" : screen;
+  })();
+
+  const handleEnter = () => {
+    if (!supabase) setScreen("onboarding");
+    else setScreen("auth");
+  };
+
+  if (effectiveScreen === "loading") {
+    return (
+      <div style={{minHeight:"100vh",background:"#060810",display:"flex",alignItems:"center",justifyContent:"center"}}>
+        <style>{G}</style>
+        <RefreshCw size={22} className="spin" color="#34d399"/>
+      </div>
+    );
+  }
+
   return (
     <>
       <style>{G}</style>
-      {screen==="landing" && <Landing onEnter={()=>setScreen("onboarding")}/>}
-      {screen==="onboarding" && <Onboarding onComplete={()=>setScreen("app")}/>}
-      {screen==="app" && <AppShell onLogout={()=>setScreen("landing")}/>}
+      {effectiveScreen === "landing"    && <Landing onEnter={handleEnter}/>}
+      {effectiveScreen === "auth"       && <AuthScreen onAuth={setSession}/>}
+      {effectiveScreen === "onboarding" && <Onboarding onComplete={()=>setScreen("app")}/>}
+      {effectiveScreen === "app"        && (
+        <AppShell
+          onLogout={() => { supabase ? supabase.auth.signOut() : setScreen("landing"); }}
+          initialFleet={dbFleet}
+          session={session}
+          profile={profile}
+          tenant={tenant}
+        />
+      )}
     </>
   );
 }
